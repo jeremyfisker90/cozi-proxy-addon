@@ -81,9 +81,17 @@ async def auto_login():
 
 @app.on_event("startup")
 async def startup_event():
+    # py-cozi turns on DEBUG logging for everything at import time, which dumps
+    # every list in full on every sync. Quiet it before it fills the log.
+    import logging
+    logging.getLogger("cozi").setLevel(logging.WARNING)
+    logging.getLogger().setLevel(logging.INFO)
     _load_sms_options()
+    _load_mirror_options()
     await auto_login()
-    asyncio.create_task(_sync_loop())     # keeps chores reconciled with Cozi + sheet
+    asyncio.create_task(_sync_loop())      # keeps chores reconciled with Cozi + sheet
+    asyncio.create_task(_mirror_loop())    # Google Calendar -> Cozi, if configured
+    asyncio.create_task(_keep_loop())      # Google Keep -> Cozi, if configured
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -1275,3 +1283,872 @@ async def chores_newweek():
         n = _roll_week(d)
         _chores_write(d)
     return {"status": "ok", "stamped": n, "week_start": d.get("week_start")}
+
+
+# ========================================================== voice intents
+# One grammar, many front doors. A Google-Assistant relay, Home Assistant
+# Assist, the dashboard mic and plain curl all POST the same raw sentence to
+# /voice/intent; everything about *understanding* it and writing it into Cozi
+# lives here, so swapping the front door never touches this file.
+
+VOICE_DB = "/data/voice.json"
+VOICE_LOG_MAX = 60
+
+# Spoken list name -> the list we actually keep it on. The Kroger list doubles
+# as the Aldi list, Home Depot doubles as Lowe's (same trip, same list).
+LIST_ALIASES = {
+    "kroger": "kroger", "krogers": "kroger", "aldi": "kroger", "aldis": "kroger",
+    "grocery": "kroger", "groceries": "kroger", "food": "kroger",
+    "shopping": "kroger", "supermarket": "kroger", "store": "kroger",
+    "costco": "costco", "warehouse": "costco", "bulk": "costco",
+    "home depot": "home depot", "homedepot": "home depot", "depot": "home depot",
+    "lowes": "home depot", "lowe's": "home depot", "hardware": "home depot",
+    "menards": "home depot", "ace": "home depot",
+}
+
+_WEEKDAYS = {"monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1,
+             "wednesday": 2, "wed": 2, "thursday": 3, "thu": 3, "thur": 3,
+             "thurs": 3, "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
+             "sunday": 6, "sun": 6}
+_MONTHS = {"january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+           "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7,
+           "jul": 7, "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+           "october": 10, "oct": 10, "november": 11, "nov": 11,
+           "december": 12, "dec": 12}
+
+# wake words and politeness the relay may pass through verbatim
+_VOICE_STRIP = re.compile(
+    r"^(?:hey|ok|okay)\s+(?:google|home|jarvis|dashboardio)\b[\s,]*"
+    r"|^(?:please|can you|could you|would you|i want you to|i need you to)\s+",
+    re.I)
+
+_LIST_RE = re.compile(
+    r"^(?:add|put|place|stick|throw|toss)\s+(?P<items>.+?)\s+"
+    r"(?:to|on|onto|in|into)\s+(?:the\s+|my\s+|our\s+)?(?P<list>.+?)"
+    r"(?:\s+list)?\s*$", re.I)
+
+_CAL_RE = re.compile(
+    r"^(?:create|add|make|schedule|book|set\s+up|put|enter)\s+"
+    r"(?:an?\s+|the\s+)?(?:new\s+)?"
+    r"(?P<kind>appointment|event|calendar\s*(?:event|entry|item)?|meeting)\b"
+    r"(?:\s+(?:in|on|to|onto)\s+(?:the\s+|our\s+|my\s+)?"
+    r"(?:cozi(?:\s+calendar)?|calendar))?"
+    r"\s*(?P<rest>.*)$", re.I)
+
+_TITLE_RE = re.compile(r"\b(?:called|titled|named|for the)\s+(?P<t>.+?)\s*$", re.I)
+_DESC_RE = re.compile(
+    r"\b(?:description|desc|notes?|note that|details?|about|remind(?:er)?(?:\s+to)?)"
+    r"\s+(?P<d>.+?)\s*$", re.I)
+
+
+def _voice_read():
+    try:
+        with open(VOICE_DB) as f:
+            return json.load(f)
+    except Exception:
+        return {"log": []}
+
+
+def _voice_write(d):
+    d["log"] = d.get("log", [])[-VOICE_LOG_MAX:]
+    with open(VOICE_DB, "w") as f:
+        json.dump(d, f)
+
+
+def _voice_log(entry):
+    d = _voice_read()
+    d.setdefault("log", []).append(entry)
+    _voice_write(d)
+
+
+def _cut(text, m):
+    """Drop a matched span out of the sentence, leaving tidy spacing."""
+    return re.sub(r"\s{2,}", " ", (text[:m.start()] + " " + text[m.end():])).strip()
+
+
+def _clean_tail(s):
+    """Trim the connective words a stripped-out date/time leaves behind."""
+    s = re.sub(r"\s{2,}", " ", (s or "")).strip(" ,.;")
+    s = re.sub(r"^(?:for|on|at|to|of|about|that|is|the)\s+", "", s, flags=re.I)
+    s = re.sub(r"\s+(?:for|on|at|to|of|and|the)$", "", s, flags=re.I)
+    return s.strip(" ,.;")
+
+
+def _v_date(text):
+    """First date phrase in the sentence -> (date, sentence without it).
+    Falls back to today. Deliberately forgiving: speech-to-text mangles
+    dates and a wrong-but-close day beats a rejected sentence."""
+    today = _now_local().date()
+
+    m = re.search(r"\b(today|tonight|tomorrow|day after tomorrow)\b", text, re.I)
+    if m:
+        word = m.group(1).lower()
+        off = {"today": 0, "tonight": 0, "tomorrow": 1, "day after tomorrow": 2}[word]
+        return today + datetime.timedelta(days=off), _cut(text, m)
+
+    m = re.search(r"\b(?:on\s+)?(this|next|coming)?\s*("
+                  + "|".join(sorted(_WEEKDAYS, key=len, reverse=True)) + r")\b",
+                  text, re.I)
+    if m:
+        want = _WEEKDAYS[m.group(2).lower()]
+        ahead = (want - today.weekday()) % 7 or 7        # always the coming one
+        d = today + datetime.timedelta(days=ahead)
+        if (m.group(1) or "").lower() == "next" and d.isocalendar()[1] == today.isocalendar()[1]:
+            d += datetime.timedelta(days=7)              # "next Monday" != this week
+        return d, _cut(text, m)
+
+    m = re.search(r"\b(?:on\s+)?(" + "|".join(sorted(_MONTHS, key=len, reverse=True))
+                  + r")\w*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b", text, re.I)
+    if m:
+        mo, day = _MONTHS[m.group(1).lower()], int(m.group(2))
+        try:
+            d = datetime.date(today.year, mo, day)
+        except ValueError:
+            return today, _cut(text, m)
+        if (today - d).days > 60:                        # said in December about January
+            d = datetime.date(today.year + 1, mo, day)
+        return d, _cut(text, m)
+
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", text)
+    if m:
+        mo, day = int(m.group(1)), int(m.group(2))
+        yr = int(m.group(3) or today.year)
+        if yr < 100:
+            yr += 2000
+        try:
+            return datetime.date(yr, mo, day), _cut(text, m)
+        except ValueError:
+            return today, _cut(text, m)
+
+    m = re.search(r"\bin\s+(\d{1,2})\s+days?\b", text, re.I)
+    if m:
+        return today + datetime.timedelta(days=int(m.group(1))), _cut(text, m)
+
+    return today, text
+
+
+def _v_time(text):
+    """First clock time -> ('HH:MM', sentence without it), or (None, text).
+    A bare hour with no am/pm is read the way a family means it: 1-7 is the
+    evening, 8-11 is the morning."""
+    m = re.search(r"\b(noon|midday|midnight)\b", text, re.I)
+    if m:
+        return ("12:00" if m.group(1).lower() != "midnight" else "00:00"), _cut(text, m)
+
+    # A number only counts as a time if something anchors it: an "at", a colon,
+    # or an am/pm. Otherwise "5 pounds of flour" becomes 5 o'clock.
+    pat = re.compile(r"\b(?P<lead>at|from|around|about)?\s*(?P<h>\d{1,2})"
+                     r"(?::(?P<m>\d{2}))?\s*(?P<mark>a\.?m\.?|p\.?m\.?|o'?clock)?\b",
+                     re.I)
+    for m in pat.finditer(text):
+        hh, mm = int(m.group("h")), int(m.group("m") or 0)
+        mark = (m.group("mark") or "").lower()
+        if hh > 24 or mm > 59:
+            continue
+        if not (m.group("lead") or m.group("m") or mark):
+            continue
+        if mark.startswith("p") and hh < 12:
+            hh += 12
+        elif mark.startswith("a") and hh == 12:
+            hh = 0
+        elif not mark.startswith(("a", "p")) and 1 <= hh <= 7:
+            hh += 12                     # "at 7" on a school night means 7pm
+        return "%02d:%02d" % (hh % 24, mm), _cut(text, m)
+    return None, text
+
+
+def _plus_hour(hhmm, hours=1):
+    h, m = (int(x) for x in hhmm.split(":"))
+    return "%02d:%02d" % ((h + hours) % 24, m)
+
+
+def _speak_time(hhmm):
+    h, m = (int(x) for x in hhmm.split(":"))
+    return "%d:%02d %s" % (h % 12 or 12, m, "AM" if h < 12 else "PM")
+
+
+_persons_cache = {"at": 0.0, "people": []}
+
+
+async def _cozi_persons(force=False):
+    """[{id, name}] for the household, cached — calendar attendees need ids."""
+    import time
+    if not force and _persons_cache["people"] and time.time() - _persons_cache["at"] < 3600:
+        return _persons_cache["people"]
+    if not cozi_client or not logged_in:
+        return []
+    raw = await cozi_client.get_persons()
+    people = []
+    for p in (raw or []):
+        if not isinstance(p, dict):
+            continue
+        pid = (p.get("accountPersonId") or p.get("personId") or p.get("id")
+               or p.get("accountPersonID"))
+        name = (p.get("name") or p.get("displayName") or "").strip()
+        if pid and name:
+            people.append({"id": pid, "name": name})
+    _persons_cache.update({"at": time.time(), "people": people})
+    return people
+
+
+def _voice_cfg():
+    """Voice settings live in /data/voice.json so they can be changed over the
+    API; the add-on options are the fallback defaults."""
+    try:
+        with open(VOICE_DB) as f:
+            return json.load(f).get("cfg") or {}
+    except Exception:
+        return {}
+
+
+def _voice_aliases():
+    """'mom=Jane, dad=John' — what a person is called out loud vs. the name on
+    the Cozi household."""
+    cfg = _voice_cfg().get("aliases")
+    if isinstance(cfg, dict):
+        return {re.sub(r"[^a-z]", "", k.lower()): re.sub(r"[^a-z]", "", str(v).lower())
+                for k, v in cfg.items()}
+    try:
+        with open("/data/options.json") as f:
+            raw = json.load(f).get("voice_aliases") or ""
+    except Exception:
+        raw = ""
+    out = {}
+    for pair in raw.split(","):
+        if "=" in pair:
+            said, real = pair.split("=", 1)
+            out[re.sub(r"[^a-z]", "", said.lower())] = re.sub(r"[^a-z]", "", real.lower())
+    return out
+
+
+def _match_person(word, people):
+    w = re.sub(r"[^a-z]", "", (word or "").lower())
+    if not w:
+        return None
+    w = _voice_aliases().get(w, w)
+    for p in people:
+        n = re.sub(r"[^a-z]", "", p["name"].lower())
+        if n == w or n.startswith(w) or w.startswith(n):
+            return p
+    return None
+
+
+def _pick_list(spoken, lists):
+    """Spoken list name -> the real Cozi list, through the alias table."""
+    want = re.sub(r"\s+list$", "", (spoken or "").strip().lower()).strip(" .,'")
+    if not want:
+        return None
+    titles = [(l, (l.get("title") or "").strip().lower()) for l in lists]
+    for l, t in titles:                                  # said the title exactly
+        if t == want:
+            return l
+    canon = LIST_ALIASES.get(want)
+    if not canon:
+        for alias, c in LIST_ALIASES.items():            # "the kroger one"
+            if alias in want:
+                canon = c
+                break
+    if canon:
+        for l, t in titles:
+            if canon.split()[0] in t:
+                return l
+    for l, t in titles:                                  # loose contains, either way
+        if want in t or t in want:
+            return l
+    return None
+
+
+async def _voice_list_add(items_text, list_name):
+    if not cozi_client or not logged_in:
+        raise HTTPException(status_code=503, detail="Cozi not connected")
+    lists = await cozi_client.get_lists()
+    target = _pick_list(list_name, lists)
+    if not target:
+        have = ", ".join((l.get("title") or "") for l in lists if l.get("title"))
+        return {"ok": False, "intent": "list",
+                "speech": "I couldn't find a list called %s. You have: %s."
+                          % (list_name, have),
+                "detail": {"asked_for": list_name, "lists": have}}
+    parts = [p.strip(" .,") for p in
+             re.split(r"\s*(?:,|\band\b|&|\bplus\b)\s*", items_text, flags=re.I)]
+    parts = [p for p in parts if p]
+    for p in parts:
+        await cozi_client.add_item(target.get("listId") or target.get("list_id"), p, 0)
+    title = target.get("title") or list_name
+    return {"ok": True, "intent": "list",
+            "speech": "Added %s to the %s list." % (_and_join(parts), title),
+            "detail": {"list": title, "items": parts}}
+
+
+def _and_join(parts):
+    if len(parts) <= 1:
+        return parts[0] if parts else ""
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+async def _voice_calendar_add(rest):
+    """'for evan on monday at 7pm description pick up his laundry' -> Cozi appt."""
+    if not cozi_client or not logged_in:
+        raise HTTPException(status_code=503, detail="Cozi not connected")
+    people = await _cozi_persons()
+    text = rest
+
+    notes = ""
+    m = _DESC_RE.search(text)
+    if m:
+        notes = _clean_tail(m.group("d"))
+        text = _cut(text, m)
+
+    attendees, who_label = [], ""
+    m = re.search(r"\bfor\s+([A-Za-z']+)\b", text, re.I)
+    if m:
+        p = _match_person(m.group(1), people)
+        if p:
+            attendees = [p["id"]]
+            who_label = p["name"]
+            text = _cut(text, m)
+
+    day, text = _v_date(text)
+    start, text = _v_time(text)
+    end = _plus_hour(start) if start else None
+
+    subject = ""
+    m = _TITLE_RE.search(text)
+    if m:
+        subject = _clean_tail(m.group("t"))
+    else:
+        subject = _clean_tail(text)
+    if not subject and notes:
+        subject = notes[:60]           # a described-only event reads better titled
+    if not subject:
+        subject = ("%s's appointment" % who_label) if who_label else "Appointment"
+
+    await cozi_client.add_appointment(
+        day.year, day.month, day.day,
+        start or "00:00", end or "00:00",
+        0 if start else 1,                 # no time given -> all-day
+        attendees, "", notes, subject)
+
+    when = "%s, %s %d" % (day.strftime("%A"), day.strftime("%B"), day.day)
+    speech = "Put %s on the Cozi calendar for %s%s%s." % (
+        subject, when,
+        (" at " + _speak_time(start)) if start else "",
+        (" for " + who_label) if who_label else "")
+    return {"ok": True, "intent": "calendar", "speech": speech,
+            "detail": {"subject": subject, "date": day.isoformat(), "start": start,
+                       "end": end, "who": who_label, "notes": notes}}
+
+
+async def _voice_dispatch(text):
+    said = _VOICE_STRIP.sub("", (text or "").strip()).strip(" .!?")
+    if not said:
+        raise HTTPException(status_code=400, detail="nothing to do")
+
+    m = _CAL_RE.match(said)               # calendar first: "on Monday" looks like a list
+    if m:
+        return await _voice_calendar_add(m.group("rest"))
+
+    m = _LIST_RE.match(said)
+    if m:
+        return await _voice_list_add(m.group("items"), m.group("list"))
+
+    return {"ok": False, "intent": "unknown",
+            "speech": "I didn't catch that. Try 'add butter to the Kroger list' or "
+                      "'create an appointment for Evan Monday at 7 pm'.",
+            "detail": {"heard": said}}
+
+
+class VoiceIntent(BaseModel):
+    text: str
+    source: str = "api"
+
+
+@app.post("/voice/intent")
+async def voice_intent(req: VoiceIntent):
+    """The single front door. Returns `speech` for the relay to read back."""
+    try:
+        res = await _voice_dispatch(req.text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        res = {"ok": False, "intent": "error", "speech": "Sorry, that didn't save.",
+               "detail": {"error": str(e)}}
+    _voice_log({"at": _now_local().isoformat(timespec="seconds"),
+                "text": req.text, "source": req.source, "ok": res.get("ok"),
+                "intent": res.get("intent"), "speech": res.get("speech"),
+                "detail": res.get("detail")})
+    return res
+
+
+@app.post("/voice/parse")
+async def voice_parse(req: VoiceIntent):
+    """Dry run — shows how a sentence is understood without writing to Cozi."""
+    said = _VOICE_STRIP.sub("", (req.text or "").strip()).strip(" .!?")
+    m = _CAL_RE.match(said)
+    if m:
+        rest = m.group("rest")
+        notes = ""
+        d = _DESC_RE.search(rest)
+        if d:
+            notes, rest = _clean_tail(d.group("d")), _cut(rest, d)
+        who = ""
+        p = re.search(r"\bfor\s+([A-Za-z']+)\b", rest, re.I)
+        if p:
+            hit = _match_person(p.group(1), await _cozi_persons())
+            if hit:
+                who, rest = hit["name"], _cut(rest, p)
+        day, rest = _v_date(rest)
+        start, rest = _v_time(rest)
+        t = _TITLE_RE.search(rest)
+        subject = _clean_tail(t.group("t")) if t else _clean_tail(rest)
+        return {"intent": "calendar", "subject": subject, "date": day.isoformat(),
+                "start": start, "who": who, "notes": notes}
+    m = _LIST_RE.match(said)
+    if m:
+        lists = await cozi_client.get_lists() if (cozi_client and logged_in) else []
+        target = _pick_list(m.group("list"), lists)
+        return {"intent": "list", "items": m.group("items"),
+                "said_list": m.group("list"),
+                "list": (target or {}).get("title")}
+    return {"intent": "unknown", "heard": said}
+
+
+class VoiceConfig(BaseModel):
+    aliases: dict | None = None
+    mirror_calendars: list | None = None
+    mirror_days: int | None = None
+    mirror_prefix: str | None = None
+    reseed: bool = False
+
+
+@app.post("/voice/config")
+async def voice_config_set(req: VoiceConfig):
+    """Change voice settings without touching the add-on's option store."""
+    d = _voice_read()
+    cfg = d.setdefault("cfg", {})
+    for k in ("aliases", "mirror_calendars", "mirror_days", "mirror_prefix"):
+        v = getattr(req, k)
+        if v is not None:
+            cfg[k] = v
+    if req.reseed:
+        d["mirrored"] = {}
+        d["mirror_seeded"] = False       # next sweep re-reads without copying
+    _voice_write(d)
+    _load_mirror_options()
+    return {"status": "ok", "cfg": cfg, "watching": MIRROR["cals"]}
+
+
+@app.get("/voice/config")
+async def voice_config_get():
+    return {"cfg": _voice_cfg(), "aliases_in_effect": _voice_aliases(),
+            "watching": MIRROR["cals"], "days": MIRROR["days"],
+            "prefix": MIRROR["prefix"]}
+
+
+@app.get("/voice/log")
+async def voice_log():
+    return _voice_read()
+
+
+# ------------------------------------------------- Google Calendar -> Cozi
+# Google's own assistant already runs a proper booking dialog ("what's the
+# title?", "what time?") and drops the result on the account's calendar. Home
+# Assistant already reads that calendar, so the cheapest voice front door is to
+# let Google take the sentence and mirror whatever lands into Cozi.
+#
+# First pass only *seeds* — every event already on the calendar is recorded as
+# seen and left alone, so turning this on never backfills months of history
+# into the family's Cozi. Only events that appear afterwards get mirrored.
+
+MIRROR = {"cals": [], "days": 60, "prefix": "", "every": 300}
+SUPERVISOR = "http://supervisor/core/api"
+SUPERVISOR_IP = "http://172.30.32.2/core/api"       # host_network can't resolve the name
+
+
+def _load_mirror_options():
+    try:
+        with open("/data/options.json") as f:
+            o = json.load(f)
+    except Exception:
+        return
+    cfg = _voice_cfg()
+    cals = cfg.get("mirror_calendars")
+    if cals is None:
+        cals = [c.strip() for c in (o.get("mirror_calendars") or "").split(",") if c.strip()]
+    MIRROR["cals"] = [c for c in cals if c]
+    MIRROR["days"] = int(cfg.get("mirror_days") or o.get("mirror_days") or 60)
+    MIRROR["prefix"] = str(cfg.get("mirror_prefix")
+                           if cfg.get("mirror_prefix") is not None
+                           else (o.get("mirror_prefix") or "")).strip().lower()
+    if MIRROR["cals"]:
+        print("Calendar mirror: watching %s" % ", ".join(MIRROR["cals"]))
+
+
+async def _ha_get(path):
+    token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not token:
+        raise RuntimeError("no SUPERVISOR_TOKEN — set homeassistant_api: true")
+    headers = {"Authorization": "Bearer " + token}
+    last = None
+    for base in (SUPERVISOR, SUPERVISOR_IP):
+        try:
+            async with aiohttp.ClientSession(headers=headers) as s:
+                async with s.get(base + path, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status < 400:
+                        return await r.json()
+                    last = "HTTP %d" % r.status
+        except Exception as e:
+            last = str(e)
+    raise RuntimeError("Home Assistant API unreachable: %s" % last)
+
+
+def _ev_when(part):
+    """HA hands back {'dateTime': '...-04:00'} or {'date': 'YYYY-MM-DD'} for
+    all-day. Already local, so read the wall-clock straight off the string."""
+    if not isinstance(part, dict):
+        part = {"dateTime": str(part)}
+    raw = part.get("dateTime") or part.get("date") or ""
+    day = raw[:10]
+    hhmm = raw[11:16] if "T" in raw else None
+    return day, hhmm
+
+
+def _mirror_attendees(summary, people):
+    """'Evan: haircut' or 'haircut for Evan' -> Evan on the Cozi appointment."""
+    m = re.match(r"^\s*([A-Za-z]+)\s*:\s*(.+)$", summary or "")
+    if m:
+        p = _match_person(m.group(1), people)
+        if p:
+            return [p["id"]], p["name"], m.group(2).strip()
+    m = re.search(r"\bfor\s+([A-Za-z]+)\b", summary or "", re.I)
+    if m:
+        p = _match_person(m.group(1), people)
+        if p:
+            return [p["id"]], p["name"], _clean_tail(_cut(summary, m))
+    for p in people:                       # bare name anywhere in the title
+        if re.search(r"\b%s\b" % re.escape(p["name"]), summary or "", re.I):
+            return [p["id"]], p["name"], summary
+    return [], "", summary
+
+
+async def _mirror_once():
+    if not MIRROR["cals"] or not cozi_client or not logged_in:
+        return {"mirrored": 0, "skipped": "not configured"}
+    state = _voice_read()
+    seen = state.setdefault("mirrored", {})
+    seeding = not state.get("mirror_seeded")
+    today = _now_local().date()
+    start = today.isoformat() + "T00:00:00"
+    end = (today + datetime.timedelta(days=MIRROR["days"])).isoformat() + "T00:00:00"
+    people = await _cozi_persons()
+    made = 0
+    for cal in MIRROR["cals"]:
+        try:
+            evs = await _ha_get("/calendars/%s?start=%s&end=%s" % (cal, start, end))
+        except Exception as e:
+            print("Calendar mirror: %s" % e)
+            continue
+        for e in evs or []:
+            summary = (e.get("summary") or "").strip()
+            day, hhmm = _ev_when(e.get("start"))
+            key = "%s|%s|%s|%s" % (cal, day, hhmm or "allday", summary.lower())
+            if key in seen:
+                continue
+            if seeding:
+                seen[key] = "seed"          # pre-existing: remember, don't copy
+                continue
+            if MIRROR["prefix"] and not summary.lower().startswith(MIRROR["prefix"]):
+                seen[key] = "skipped"
+                continue
+            eday, ehhmm = _ev_when(e.get("end"))
+            att, who, subject = _mirror_attendees(summary, people)
+            if MIRROR["prefix"]:
+                subject = subject[len(MIRROR["prefix"]):].strip(" :-") or subject
+            try:
+                y, mo, dd = (int(x) for x in day.split("-"))
+                await cozi_client.add_appointment(
+                    y, mo, dd, hhmm or "00:00",
+                    (ehhmm or _plus_hour(hhmm)) if hhmm else "00:00",
+                    0 if hhmm else 1, att, (e.get("location") or ""),
+                    (e.get("description") or ""), subject or "Appointment")
+            except Exception as ex:
+                print("Calendar mirror: could not copy %r (%s)" % (summary, ex))
+                continue
+            seen[key] = _now_local().isoformat(timespec="seconds")
+            made += 1
+            _voice_log({"at": _now_local().isoformat(timespec="seconds"),
+                        "text": summary, "source": "gcal", "ok": True,
+                        "intent": "calendar",
+                        "speech": "Copied %s to Cozi for %s%s."
+                                  % (subject, day, (" (" + who + ")") if who else ""),
+                        "detail": {"calendar": cal, "date": day, "start": hhmm}})
+            state = _voice_read()           # _voice_log rewrote the file
+            seen = state.setdefault("mirrored", {})
+            seen[key] = _now_local().isoformat(timespec="seconds")
+    if len(seen) > 800:                     # keep the ledger from growing forever
+        for k in list(seen)[:len(seen) - 800]:
+            seen.pop(k, None)
+    state["mirror_seeded"] = True
+    _voice_write(state)
+    if seeding:
+        print("Calendar mirror: seeded %d existing events (none copied)" % len(seen))
+    return {"mirrored": made, "seeded": seeding, "watching": MIRROR["cals"]}
+
+
+async def _mirror_loop():
+    while True:
+        try:
+            if MIRROR["cals"]:
+                await _mirror_once()
+        except Exception as e:
+            print("Calendar mirror loop: %s" % e)
+        await asyncio.sleep(MIRROR["every"])
+
+
+@app.post("/voice/mirror")
+async def voice_mirror_now():
+    """Run the Google-Calendar sweep immediately."""
+    return await _mirror_once()
+
+
+@app.get("/voice/mirror")
+async def voice_mirror_status():
+    state = _voice_read()
+    return {"watching": MIRROR["cals"], "days": MIRROR["days"],
+            "prefix": MIRROR["prefix"], "seeded": bool(state.get("mirror_seeded")),
+            "known_events": len(state.get("mirrored", {}))}
+
+
+@app.get("/cozi/calendar/{year}/{month}")
+async def cozi_calendar(year: int, month: int):
+    """A month of Cozi appointments — verification, and the dedupe key for any
+    calendar mirror that feeds /voice/intent."""
+    if not cozi_client or not logged_in:
+        raise HTTPException(status_code=503, detail="Cozi not connected")
+    return await cozi_client.get_calendar(year, month)
+
+
+# ------------------------------------------------------- Google Keep -> Cozi
+# "Hey Google, add butter to my Kroger list" lands in Google Keep, because Keep
+# is the only notes app Google still talks to. There is no official Keep API
+# for personal accounts, so this rides on gkeepapi with a master token the
+# owner mints once. New (unchecked) items on a Keep list are copied into the
+# Cozi list with the matching name and then ticked off in Keep, so the tick is
+# the "already synced" marker and nothing arrives twice.
+
+KEEP_DB = "/data/keep.json"
+KEEP = {"every": 60, "err": "", "last": "", "count": 0}
+
+
+def _keep_read():
+    try:
+        with open(KEEP_DB) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _keep_write(d):
+    with open(KEEP_DB, "w") as f:
+        json.dump(d, f)
+    try:
+        os.chmod(KEEP_DB, 0o600)          # it holds an account token
+    except Exception:
+        pass
+
+
+def _android_id(d):
+    if not d.get("android_id"):
+        import random
+        d["android_id"] = "%016x" % random.getrandbits(64)
+    return d["android_id"]
+
+
+def _keep_sync_sync():
+    """Blocking half of the Keep poll — gkeepapi is synchronous."""
+    d = _keep_read()
+    if not d.get("email") or not d.get("master_token"):
+        return {"ok": False, "reason": "not configured"}
+    import gkeepapi
+    keep = gkeepapi.Keep()
+    state = d.get("state")
+    ok = False
+    for attempt in ("authenticate", "resume"):
+        fn = getattr(keep, attempt, None)
+        if not fn:
+            continue
+        try:
+            fn(d["email"], d["master_token"], state=state)
+            ok = True
+            break
+        except TypeError:
+            try:
+                fn(d["email"], d["master_token"])
+                ok = True
+                break
+            except Exception as e:
+                last = e
+        except Exception as e:
+            last = e
+    if not ok:
+        return {"ok": False, "reason": "login failed: %s" % last}
+    lists = [n for n in keep.all() if getattr(n, "type", None)
+             and str(n.type).endswith("List")]
+    return {"ok": True, "keep": keep, "lists": lists, "state": keep.dump()}
+
+
+async def _keep_once():
+    if not cozi_client or not logged_in:
+        return {"synced": 0, "reason": "Cozi not connected"}
+    res = await asyncio.to_thread(_keep_sync_sync)
+    if not res.get("ok"):
+        KEEP["err"] = res.get("reason", "")
+        return {"synced": 0, "reason": KEEP["err"]}
+    KEEP["err"] = ""
+    keep, lists = res["keep"], res["lists"]
+    cozi_lists = await cozi_client.get_lists()
+    d = _keep_read()
+    made, touched = 0, []
+    for note in lists:
+        title = (note.title or "").strip()
+        target = _pick_list(title, cozi_lists)
+        if not target:
+            continue
+        for item in list(note.items):
+            if item.checked:
+                continue
+            text = (item.text or "").strip()
+            if not text:
+                continue
+            await cozi_client.add_item(target.get("listId") or target.get("list_id"), text, 0)
+            item.checked = True            # the tick is the synced marker
+            made += 1
+            touched.append("%s -> %s" % (text, target.get("title")))
+            _voice_log({"at": _now_local().isoformat(timespec="seconds"),
+                        "text": text, "source": "keep", "ok": True, "intent": "list",
+                        "speech": "Copied %s from the %s Keep list to %s."
+                                  % (text, title, target.get("title")),
+                        "detail": {"keep_list": title, "cozi_list": target.get("title")}})
+    if made:
+        await asyncio.to_thread(keep.sync)
+    d["state"] = keep.dump()
+    d["last"] = _now_local().isoformat(timespec="seconds")
+    _keep_write(d)
+    KEEP["last"] = d["last"]
+    KEEP["count"] += made
+    return {"synced": made, "items": touched}
+
+
+async def _keep_loop():
+    while True:
+        try:
+            if _keep_read().get("master_token"):
+                await _keep_once()
+        except Exception as e:
+            KEEP["err"] = str(e)
+            print("Keep sync: %s" % e)
+        await asyncio.sleep(KEEP["every"])
+
+
+class KeepLogin(BaseModel):
+    email: str
+    oauth_token: str | None = None     # from accounts.google.com/EmbeddedSetup
+    master_token: str | None = None    # if you already minted one
+
+
+@app.post("/keep/login")
+async def keep_login(req: KeepLogin):
+    """Store Keep credentials. Give an oauth_token and the add-on trades it for
+    a master token itself, so the long-lived secret never leaves this box."""
+    d = _keep_read()
+    d["email"] = req.email.strip()
+    if req.master_token:
+        d["master_token"] = req.master_token.strip()
+    elif req.oauth_token:
+        import gpsoauth
+        aid = _android_id(d)
+        res = await asyncio.to_thread(gpsoauth.exchange_token,
+                                      d["email"], req.oauth_token.strip(), aid)
+        tok = res.get("Token")
+        if not tok:
+            raise HTTPException(status_code=400,
+                                detail="Google refused the oauth_token: %s"
+                                       % (res.get("Error") or res))
+        d["master_token"] = tok
+    else:
+        raise HTTPException(status_code=400, detail="need oauth_token or master_token")
+    d.pop("state", None)
+    _keep_write(d)
+    out = await _keep_once()
+    return {"status": "ok", "email": d["email"], "first_sync": out}
+
+
+@app.get("/keep/status")
+async def keep_status():
+    d = _keep_read()
+    return {"configured": bool(d.get("master_token")), "email": d.get("email", ""),
+            "last_sync": d.get("last", ""), "synced_this_run": KEEP["count"],
+            "error": KEEP["err"]}
+
+
+@app.post("/keep/sync")
+async def keep_sync_now():
+    return await _keep_once()
+
+
+class KeepNewList(BaseModel):
+    title: str
+
+
+@app.post("/keep/newlist")
+async def keep_newlist(req: KeepNewList):
+    """Create an empty Keep list, so 'add X to my <name> list' has a home."""
+    def _mk():
+        res = _keep_sync_sync()
+        if not res.get("ok"):
+            return res
+        keep = res["keep"]
+        for n in res["lists"]:
+            if (n.title or "").strip().lower() == req.title.strip().lower():
+                return {"ok": True, "existed": True}
+        keep.createList(req.title.strip(), [])
+        keep.sync()
+        return {"ok": True, "existed": False, "state": keep.dump()}
+    out = await asyncio.to_thread(_mk)
+    if not out.get("ok"):
+        raise HTTPException(status_code=400, detail=out.get("reason"))
+    if out.get("state"):
+        d = _keep_read()
+        d["state"] = out["state"]
+        _keep_write(d)
+    return {"status": "ok", "title": req.title, "already_there": out.get("existed")}
+
+
+@app.get("/keep/lists")
+async def keep_lists():
+    """What Keep has, and which Cozi list each one would land on."""
+    res = await asyncio.to_thread(_keep_sync_sync)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("reason"))
+    cozi_lists = await cozi_client.get_lists() if (cozi_client and logged_in) else []
+    out = []
+    for note in res["lists"]:
+        target = _pick_list((note.title or "").strip(), cozi_lists)
+        out.append({"keep": note.title,
+                    "cozi": (target or {}).get("title"),
+                    "open_items": [i.text for i in note.items if not i.checked]})
+    return {"lists": out}
+
+
+@app.delete("/cozi/calendar/{year}/{month}/{appt_id}")
+async def cozi_calendar_remove(year: int, month: int, appt_id: str):
+    if not cozi_client or not logged_in:
+        raise HTTPException(status_code=503, detail="Cozi not connected")
+    await cozi_client.remove_appointment(year, month, appt_id)
+    return {"status": "ok", "removed": appt_id}
+
+
+@app.get("/voice/persons")
+async def voice_persons():
+    """Household members and their Cozi ids — the calendar attendee map."""
+    return {"people": await _cozi_persons(force=True)}

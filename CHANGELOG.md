@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.18.1
+- `POST /keep/newlist` creates an empty Keep list.
+
+## 1.18.0
+- Google Keep -> Cozi: `POST /keep/login` (email + an oauth_token from
+  accounts.google.com/EmbeddedSetup, exchanged for a master token on the box)
+  then every 60s new unchecked items on a Keep list are copied into the Cozi
+  list with the matching name and ticked off in Keep. `GET /keep/lists` shows
+  the mapping, `GET /keep/status` the health, `POST /keep/sync` runs it now.
+
+## 1.17.2
+- `DELETE /cozi/calendar/{year}/{month}/{id}` removes an appointment.
+
+## 1.17.1
+- `POST /voice/config` sets the spoken-name aliases and the mirror settings
+  at runtime (stored in /data/voice.json, overriding the add-on options).
+
+## 1.17.0
+- Google Calendar mirror: `mirror_calendars` copies newly-added events from
+  Home Assistant calendar entities into Cozi (attendee picked up from an
+  "Evan:" prefix or a name in the title, description carried into the notes).
+  The first pass only records existing events, so nothing backfills; optional
+  `mirror_prefix` limits it to titles starting with a keyword. `POST
+  /voice/mirror` runs a sweep on demand, `GET /voice/mirror` shows status.
+- Quieted py-cozi's DEBUG logging, which was dumping every list on every sync.
+
+## 1.16.2
+- `GET /cozi/calendar/{year}/{month}` reads a month of Cozi appointments.
+
+## 1.16.1
+- `voice_aliases` option ("mom=Jane, dad=John") maps spoken names onto Cozi
+  household members for calendar attendees.
+
+## 1.16.0
+- Voice intents: `POST /voice/intent {text}` understands plain sentences and
+  writes them into Cozi — "add butter to the Kroger list" (alias table maps
+  Aldi to the Kroger list, Lowe's to Home Depot) and "create an appointment
+  for Evan Monday at 7 pm description pick up his laundry" (attendee, date,
+  time, notes). Returns a `speech` string for the front door to read back.
+  `POST /voice/parse` dry-runs a sentence, `GET /voice/log` shows the last 60,
+  `GET /voice/persons` lists the household's Cozi attendee ids.
+
 ## 1.15.0
 - Floorplan layout store: `GET/POST /floorplan` persists the dashboard's
   room + furniture editor layout in `/data/floorplan.json`.

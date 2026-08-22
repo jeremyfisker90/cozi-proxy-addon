@@ -1,5 +1,5 @@
 name: "Cozi Proxy API"
-version: "1.15.0"
+version: "1.18.1"
 slug: "cozi_proxy2"
 description: "Local API bridge for Cozi To-Do lists"
 arch:
@@ -8,6 +8,7 @@ arch:
 startup: services
 boot: auto
 host_network: true
+homeassistant_api: true
 
 # User-configurable options (shown in Supervisor UI).
 # cozi_enabled: false (or blank credentials) runs the chores engine in
@@ -28,6 +29,18 @@ options:
   phone_mom: ""
   phone_dad: ""
   timezone: "America/New_York"
+  # --- voice intents (optional). Maps what people are *called* out loud to the
+  # names on your Cozi household, for "create an appointment for mom...".
+  # Format: "mom=Jane, dad=John". Leave blank if the spoken names match Cozi.
+  voice_aliases: ""
+  # --- Google Calendar mirror (optional). Comma-separated Home Assistant
+  # calendar entity ids to copy new events from into Cozi — this is what makes
+  # "Hey Google, create an event..." land on the family calendar. The first
+  # pass only records what is already there, so nothing backfills. Set
+  # mirror_prefix (e.g. "cozi") to copy only titles that start with that word.
+  mirror_calendars: ""
+  mirror_days: 60
+  mirror_prefix: ""
 
 # Schema for the add-on configuration UI
 schema:
@@ -42,6 +55,10 @@ schema:
   phone_mom: str
   phone_dad: str
   timezone: str
+  voice_aliases: str
+  mirror_calendars: str
+  mirror_days: int
+  mirror_prefix: str
 
 # No need for environment variables anymore
 environment: {}
