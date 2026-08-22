@@ -1,0 +1,50 @@
+name: "Cozi Proxy API"
+version: "1.15.0"
+slug: "cozi_proxy2"
+description: "Local API bridge for Cozi To-Do lists"
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+host_network: true
+
+# User-configurable options (shown in Supervisor UI).
+# cozi_enabled: false (or blank credentials) runs the chores engine in
+# Google/sheet-only mode — no Cozi login, no Cozi list mirroring.
+options:
+  username: ""
+  password: ""
+  cozi_enabled: true
+  # --- chore texting (optional). Texts go out through your carrier's
+  # email-to-SMS gateway, sent from a Gmail account via an app password
+  # (Google Account -> Security -> 2-Step Verification -> App passwords).
+  # Leave smtp_user/smtp_pass blank to disable texting entirely.
+  smtp_user: ""
+  smtp_pass: ""
+  sms_gateway: "vtext.com"     # Verizon. AT&T: txt.att.net, T-Mobile: tmomail.net
+  phone_ian: ""
+  phone_evan: ""
+  phone_mom: ""
+  phone_dad: ""
+  timezone: "America/New_York"
+
+# Schema for the add-on configuration UI
+schema:
+  username: str
+  password: str
+  cozi_enabled: bool
+  smtp_user: str
+  smtp_pass: password
+  sms_gateway: str
+  phone_ian: str
+  phone_evan: str
+  phone_mom: str
+  phone_dad: str
+  timezone: str
+
+# No need for environment variables anymore
+environment: {}
+
+ports:
+  5000/tcp: 5000

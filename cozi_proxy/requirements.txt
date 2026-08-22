@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+requests
+py-cozi>=2026.2.1
+tzdata
+
+ 
