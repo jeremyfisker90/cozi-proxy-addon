@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.19.0
+- `POST /chores/adhoc` (name, description, points, kid) drops a one-off chore
+  straight into a kid's queue and texts them a custom heads-up. Frequency
+  "once" never reposts and is cleared on the weekly roll once done.
+
 ## 1.18.1
 - `POST /keep/newlist` creates an empty Keep list.
 

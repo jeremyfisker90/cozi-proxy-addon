@@ -308,7 +308,8 @@ _chores_lock = asyncio.Lock()
 COZI_LISTS = {"chores required": "required", "chores optional": "optional"}
 SYNC_EVERY = 300  # seconds
 
-FREQ_DAYS = {"daily": 1, "weekly": 7, "bi-weekly": 14, "biweekly": 14, "monthly": 30}
+FREQ_DAYS = {"daily": 1, "weekly": 7, "bi-weekly": 14, "biweekly": 14, "monthly": 30,
+             "once": 3650}   # one-off (ad-hoc): effectively never reposts once done
 FREQ_CANON = {"daily": "daily", "weekly": "weekly", "bi-weekly": "bi-weekly",
               "biweekly": "bi-weekly", "monthly": "monthly"}
 DEFAULT_FREQ = "weekly"
@@ -649,6 +650,9 @@ def _roll_week(d, on=None):
                            "points": c.get("points", 0)} for c in done],
         })
         d["history"] = d["history"][-52:]          # keep a year
+    # one-off ad-hoc chores that got done just disappear; they don't repost
+    d["chores"] = [c for c in d["chores"]
+                   if not (c.get("frequency") == "once" and c.get("done_by"))]
     for c in d["chores"]:
         c["done_by"] = None
         c.pop("rejected", None)
@@ -1042,6 +1046,39 @@ async def chores_add(req: ChoreAdd):
         d["next_id"] = cid + 1
         _chores_write(d)
     return {"status": "ok", "id": cid}
+
+
+class ChoreAdHoc(BaseModel):
+    name: str
+    description: str = ""
+    points: int = 0
+    kid: str                     # ian or evan
+
+
+@app.post("/chores/adhoc")
+async def chores_adhoc(req: ChoreAdHoc):
+    """Parent adds a one-off chore straight into a kid's queue and texts them.
+    It's a normal chore (claimable for points) but frequency 'once' so the
+    weekly roll drops it instead of reposting."""
+    kid = req.kid.lower()
+    if kid not in ("ian", "evan"):
+        raise HTTPException(status_code=400, detail="kid must be ian or evan")
+    async with _chores_lock:
+        d = _chores_read()
+        cid = d.get("next_id", 1)
+        c = {"id": cid, "name": req.name.strip(),
+             "points": int(req.points), "description": (req.description or "").strip(),
+             "kind": "required", "frequency": "once", "assigned_to": kid,
+             "queued_for": kid, "last_done": None, "posted": True,
+             "done_by": None, "source": "adhoc"}
+        d["chores"].append(c)
+        d["next_id"] = cid + 1
+        _chores_write(d)
+    what = c["description"] or c["name"]
+    body = ("Times are tough, cupcake. We need you to do something a little "
+            "different today — we need you to %s (%s pts)." % (what, c["points"]))
+    sent = await _send_sms(kid, body)
+    return {"status": "ok", "id": cid, "sms": sent}
 
 
 @app.post("/chores/edit")
