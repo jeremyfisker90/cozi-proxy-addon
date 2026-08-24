@@ -659,13 +659,28 @@ def _repost(d, on=None):
         c["posted"] = True if c.get("rejected") else _is_due(c, on)
 
 
+def _credits(chores, kid):
+    """A kid's optional-unlock balance: each REQUIRED chore they finish unlocks
+    one optional; each OPTIONAL they finish spends one. 1 required = 1 optional,
+    rolling all week (resets when the weekly roll clears done_by)."""
+    rq = sum(1 for c in chores
+             if c.get("kind", "required") == "required" and c.get("done_by") == kid)
+    op = sum(1 for c in chores
+             if c.get("kind") == "optional" and c.get("done_by") == kid)
+    return rq - op
+
+
 def _gate(chores):
-    """Optional chores stay locked until every POSTED required chore is claimed."""
+    """Board state. Optional chores are unlocked per-kid on a 1-required-unlocks-
+    1-optional basis (see _credits); `optional_unlocked` is true if either kid
+    currently has an unlock to spend."""
     req = [c for c in chores
            if c.get("kind", "required") == "required" and c.get("posted", True)]
     left = [c for c in req if not c.get("done_by")]
+    credits = {k: max(0, _credits(chores, k)) for k in ("ian", "evan")}
     return {"required_total": len(req), "required_left": len(left),
-            "optional_unlocked": len(left) == 0}
+            "optional_credits": credits,
+            "optional_unlocked": any(v > 0 for v in credits.values())}
 
 
 def _roll_week(d, on=None):
@@ -1270,11 +1285,11 @@ async def chores_claim(req: ChoreClaim):
             raise HTTPException(status_code=425,
                                 detail="Not due yet — back on the board %s"
                                        % (dd.strftime("%b %-d") if dd else "soon"))
-        gate = _gate(d["chores"])
-        if target.get("kind", "required") == "optional" and not gate["optional_unlocked"]:
+        if target.get("kind", "required") == "optional" and _credits(d["chores"], kid) < 1:
+            lbl = PEOPLE_LABEL.get(kid, kid.title())
             raise HTTPException(status_code=423,
-                                detail="Finish the %d required chore(s) first"
-                                       % gate["required_left"])
+                                detail="%s needs to finish a REQUIRED chore first — "
+                                       "each required chore unlocks one optional." % lbl)
         target["done_by"] = kid
         target["done_on"] = _today().isoformat()
         target.pop("rejected", None)          # redone -> clear the parent's note

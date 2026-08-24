@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.20.3
+- Optional chores now unlock 1-for-1 instead of all-or-nothing: each REQUIRED
+  chore a kid finishes unlocks one OPTIONAL chore for that kid (spent when they
+  finish one), rolling all week. `/chores` now returns `optional_credits`
+  {ian, evan}; `optional_unlocked` is true if either kid has an unlock to spend.
+  Claiming an optional with no credit returns 423 with a per-kid message.
+
 ## 1.20.2
 - `POST /chores/reset` fully resets tracking to week one — erases history,
   banked totals, streaks, rejections, per-kid logs and queues, and reopens
