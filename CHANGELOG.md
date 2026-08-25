@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.20.5
+- Mines game: `POST /chores/mines/{start,pick,cashout}`. Stake a bet, reveal gems
+  on a 9-tile board (4 mines) for a rising multiplier, cash out before you hit a
+  mine. Payouts are below fair so the house keeps its edge; mine positions live
+  only on the server so the board can't be read from the browser.
+
 ## 1.20.4
 - `POST /chores/gamble` (kid, wager) — the Chore Casino. A kid stakes weekly
   points on a 1-in-4 double-or-nothing spin (house wins ~75%). RNG decided

@@ -1415,6 +1415,7 @@ def _reset_all(d, on=None):
     d["log"] = {"ian": [], "evan": []}
     d["history"] = []
     d["rejections"] = []
+    d["mines"] = {}
     d["week_start"] = _monday(on).isoformat()
     return len(d["chores"])
 
@@ -1477,6 +1478,114 @@ async def chores_gamble(req: ChoreGamble):
         _chores_write(d)
     return {"result": "win" if win else "lose", "wager": wager, "delta": delta,
             "new_total": new_total, "odds": GAMBLE_WIN_ODDS}
+
+
+# ---- Mines: reveal gems for a rising multiplier, cash out before you hit a mine.
+# 9 tiles, 4 mines. Payouts are BELOW fair on purpose so the house keeps its edge
+# (fair 2-gem ~3.6x, we pay 2x). Mine positions live only on the server.
+MINES_TILES = 9
+MINES_COUNT = 4
+MINES_MULTS = [1.3, 2.0, 3.3, 6.0, 13.0]   # multiplier after 1..5 gems found
+
+
+class MinesStart(BaseModel):
+    kid: str
+    wager: int
+
+
+class MinesPick(BaseModel):
+    game_id: str
+    tile: int
+
+
+class MinesGame(BaseModel):
+    game_id: str
+
+
+@app.post("/chores/mines/start")
+async def mines_start(req: MinesStart):
+    import random
+    import time
+    kid = req.kid.lower()
+    if kid not in ("ian", "evan"):
+        raise HTTPException(status_code=400, detail="kid must be ian or evan")
+    wager = int(req.wager)
+    if wager <= 0:
+        raise HTTPException(status_code=400, detail="Bet has to be at least 1 point.")
+    async with _chores_lock:
+        d = _chores_read()
+        d.setdefault("log", {}).setdefault(kid, [])
+        total = sum(int(e.get("points", 0)) for e in d["log"][kid])
+        if wager > total:
+            raise HTTPException(status_code=409,
+                                detail="You only have %d point%s to bet." % (total, "" if total == 1 else "s"))
+        # stake is taken up front; you win it back (times the multiplier) only on a cash-out
+        d["log"][kid].append({"chore_id": None, "kind": "mines",
+                              "name": "💣 Mines bet -%d" % wager, "points": -wager,
+                              "at": _today().isoformat()})
+        gid = "%s-%d" % (kid, int(time.time() * 1000))
+        games = d.setdefault("mines", {})
+        for k in list(games.keys())[:-20]:            # keep the last 20 games only
+            games.pop(k, None)
+        games[gid] = {"kid": kid, "wager": wager,
+                      "mines": random.sample(range(MINES_TILES), MINES_COUNT),
+                      "revealed": [], "active": True}
+        _chores_write(d)
+    return {"game_id": gid, "tiles": MINES_TILES, "num_mines": MINES_COUNT, "mults": MINES_MULTS}
+
+
+@app.post("/chores/mines/pick")
+async def mines_pick(req: MinesPick):
+    async with _chores_lock:
+        d = _chores_read()
+        g = (d.get("mines") or {}).get(req.game_id)
+        if not g or not g.get("active"):
+            raise HTTPException(status_code=404, detail="no active game")
+        tile = int(req.tile)
+        if tile < 0 or tile >= MINES_TILES or tile in g["revealed"]:
+            raise HTTPException(status_code=409, detail="bad tile")
+        if tile in g["mines"]:                          # boom — stake is gone
+            g["active"] = False
+            _chores_write(d)
+            return {"mine": True, "mines": g["mines"], "revealed": g["revealed"]}
+        g["revealed"].append(tile)
+        gems = len(g["revealed"])
+        mult = MINES_MULTS[min(gems, len(MINES_MULTS)) - 1]
+        cashout = round(g["wager"] * mult)
+        if gems >= len(MINES_MULTS):                    # cleared them all -> auto cash-out
+            kid = g["kid"]
+            d["log"][kid].append({"chore_id": None, "kind": "mines",
+                                  "name": "💣 Mines JACKPOT +%d" % cashout, "points": cashout,
+                                  "at": _today().isoformat()})
+            g["active"] = False
+            new_total = sum(int(e.get("points", 0)) for e in d["log"][kid])
+            _chores_write(d)
+            return {"mine": False, "tile": tile, "gems": gems, "multiplier": mult,
+                    "cashout": cashout, "auto_cashout": True, "new_total": new_total}
+        _chores_write(d)
+    return {"mine": False, "tile": tile, "gems": gems, "multiplier": mult, "cashout": cashout}
+
+
+@app.post("/chores/mines/cashout")
+async def mines_cashout(req: MinesGame):
+    async with _chores_lock:
+        d = _chores_read()
+        g = (d.get("mines") or {}).get(req.game_id)
+        if not g or not g.get("active"):
+            raise HTTPException(status_code=404, detail="no active game")
+        gems = len(g["revealed"])
+        if gems == 0:
+            raise HTTPException(status_code=409, detail="reveal at least one tile first")
+        mult = MINES_MULTS[min(gems, len(MINES_MULTS)) - 1]
+        payout = round(g["wager"] * mult)
+        kid = g["kid"]
+        d["log"][kid].append({"chore_id": None, "kind": "mines",
+                              "name": "💣 Mines cashout +%d" % payout, "points": payout,
+                              "at": _today().isoformat()})
+        g["active"] = False
+        new_total = sum(int(e.get("points", 0)) for e in d["log"][kid])
+        _chores_write(d)
+    return {"payout": payout, "multiplier": mult, "gems": gems, "new_total": new_total}
 
 
 # ========================================================== voice intents
