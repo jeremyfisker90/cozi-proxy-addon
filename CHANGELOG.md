@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.20.4
+- `POST /chores/gamble` (kid, wager) — the Chore Casino. A kid stakes weekly
+  points on a 1-in-4 double-or-nothing spin (house wins ~75%). RNG decided
+  server-side so the reels can't be rigged; wager capped at the kid's balance so
+  a score can't go negative. Spins recorded in a `gambles` ledger.
+
 ## 1.20.3
 - Optional chores now unlock 1-for-1 instead of all-or-nothing: each REQUIRED
   chore a kid finishes unlocks one OPTIONAL chore for that kid (spent when they

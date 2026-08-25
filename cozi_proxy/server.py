@@ -1431,6 +1431,54 @@ async def chores_reset():
     return {"status": "ok", "reset": n, "week_start": d.get("week_start")}
 
 
+class ChoreGamble(BaseModel):
+    kid: str                     # ian or evan
+    wager: int
+
+
+# The house edge: the player wins WIN_ODDS of the time (double-or-nothing), so the
+# expected value is 0.25*(+w) + 0.75*(-w) = -0.5w — the house wins ~75% of spins.
+GAMBLE_WIN_ODDS = 0.25
+
+
+@app.post("/chores/gamble")
+async def chores_gamble(req: ChoreGamble):
+    """Chore Casino: a kid stakes some of their weekly points on a 1-in-4 spin.
+    Win -> the wager is doubled (net +wager); lose -> the wager is gone (-wager).
+    The RNG is decided HERE, server-side, so the reels can't be rigged from the
+    browser. The wager is capped at what the kid currently has, so a score can't
+    go negative."""
+    import random
+    kid = req.kid.lower()
+    if kid not in ("ian", "evan"):
+        raise HTTPException(status_code=400, detail="kid must be ian or evan")
+    wager = int(req.wager)
+    if wager <= 0:
+        raise HTTPException(status_code=400, detail="Bet has to be at least 1 point.")
+    async with _chores_lock:
+        d = _chores_read()
+        d.setdefault("log", {}).setdefault(kid, [])
+        total = sum(int(e.get("points", 0)) for e in d["log"][kid])
+        if wager > total:
+            raise HTTPException(status_code=409,
+                                detail="You only have %d point%s to bet."
+                                       % (total, "" if total == 1 else "s"))
+        win = random.random() < GAMBLE_WIN_ODDS
+        delta = wager if win else -wager
+        d["log"][kid].append({
+            "chore_id": None, "kind": "gamble",
+            "name": "🎰 Casino %s" % ("WIN +%d" % wager if win else "loss -%d" % wager),
+            "points": delta, "at": _today().isoformat()})
+        ledger = d.setdefault("gambles", [])
+        ledger.append({"kid": kid, "wager": wager, "win": win,
+                       "at": _stamp(_now_local())})
+        d["gambles"] = ledger[-200:]
+        new_total = total + delta
+        _chores_write(d)
+    return {"result": "win" if win else "lose", "wager": wager, "delta": delta,
+            "new_total": new_total, "odds": GAMBLE_WIN_ODDS}
+
+
 # ========================================================== voice intents
 # One grammar, many front doors. A Google-Assistant relay, Home Assistant
 # Assist, the dashboard mic and plain curl all POST the same raw sentence to
