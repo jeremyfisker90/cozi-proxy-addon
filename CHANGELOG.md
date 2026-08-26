@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.20.7
+- Blackjack: `POST /chores/bj/{start,hit,stand}`. Hit/stand against the dealer;
+  house-favored rules (dealer draws to 17 and wins ties, blackjack pays even
+  money). Deck + dealer hole card stay server-side so the hand can't be read.
+
 ## 1.20.6
 - Queue expiry: a chore a KID grabs into their own queue (`queued_by: self`)
   falls back onto the board if it's still unfinished 24h later. A chore a PARENT

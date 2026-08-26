@@ -1457,6 +1457,7 @@ def _reset_all(d, on=None):
     d["history"] = []
     d["rejections"] = []
     d["mines"] = {}
+    d["bj"] = {}
     d["week_start"] = _monday(on).isoformat()
     return len(d["chores"])
 
@@ -1627,6 +1628,135 @@ async def mines_cashout(req: MinesGame):
         new_total = sum(int(e.get("points", 0)) for e in d["log"][kid])
         _chores_write(d)
     return {"payout": payout, "multiplier": mult, "gems": gems, "new_total": new_total}
+
+
+# ---- Blackjack. House-favored house rules: dealer draws to 17 and WINS TIES,
+# and a blackjack pays even money (not 3:2). Deck + dealer's hole card stay on
+# the server so the hand can't be read from the browser.
+BJ_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+BJ_SUITS = ["♠", "♥", "♦", "♣"]
+
+
+def _bj_deck():
+    import random
+    deck = [r + s for s in BJ_SUITS for r in BJ_RANKS]
+    random.shuffle(deck)
+    return deck
+
+
+def _bj_val(cards):
+    total, aces = 0, 0
+    for c in cards:
+        r = c[:-1]
+        if r == "A":
+            total += 11; aces += 1
+        elif r in ("K", "Q", "J", "10"):
+            total += 10
+        else:
+            total += int(r)
+    while total > 21 and aces:
+        total -= 10; aces -= 1
+    return total
+
+
+class BjStart(BaseModel):
+    kid: str
+    wager: int
+
+
+class BjGame(BaseModel):
+    game_id: str
+
+
+def _bj_win_log(d, kid, name, pts):
+    d["log"][kid].append({"chore_id": None, "kind": "bj", "name": name, "points": pts,
+                          "at": _today().isoformat()})
+
+
+@app.post("/chores/bj/start")
+async def bj_start(req: BjStart):
+    import time
+    kid = req.kid.lower()
+    if kid not in ("ian", "evan"):
+        raise HTTPException(status_code=400, detail="kid must be ian or evan")
+    wager = int(req.wager)
+    if wager <= 0:
+        raise HTTPException(status_code=400, detail="Bet has to be at least 1 point.")
+    async with _chores_lock:
+        d = _chores_read()
+        d.setdefault("log", {}).setdefault(kid, [])
+        total = sum(int(e.get("points", 0)) for e in d["log"][kid])
+        if wager > total:
+            raise HTTPException(status_code=409,
+                                detail="You only have %d point%s to bet." % (total, "" if total == 1 else "s"))
+        _bj_win_log(d, kid, "🃏 Blackjack bet -%d" % wager, -wager)
+        deck = _bj_deck()
+        player = [deck.pop(), deck.pop()]
+        dealer = [deck.pop(), deck.pop()]
+        gid = "%s-%d" % (kid, int(time.time() * 1000))
+        games = d.setdefault("bj", {})
+        for k in list(games.keys())[:-20]:
+            games.pop(k, None)
+        games[gid] = {"kid": kid, "wager": wager, "deck": deck, "player": player,
+                      "dealer": dealer, "active": True}
+        pv, dv = _bj_val(player), _bj_val(dealer)
+        if pv == 21 or dv == 21:                        # naturals settle right away
+            games[gid]["active"] = False
+            if pv == 21 and dv < 21:
+                payout = wager * 2
+                _bj_win_log(d, kid, "🃏 Blackjack! +%d" % payout, payout)
+                result = "blackjack"
+            else:                                        # dealer 21 (or push) -> dealer wins
+                payout = 0
+                result = "dealer"
+            new_total = sum(int(e.get("points", 0)) for e in d["log"][kid])
+            _chores_write(d)
+            return {"game_id": gid, "player": player, "dealer": dealer, "player_total": pv,
+                    "dealer_total": dv, "done": True, "result": result, "payout": payout,
+                    "new_total": new_total}
+        _chores_write(d)
+    return {"game_id": gid, "player": player, "dealer": [dealer[0], "??"],
+            "player_total": pv, "dealer_up": _bj_val([dealer[0]]), "done": False}
+
+
+@app.post("/chores/bj/hit")
+async def bj_hit(req: BjGame):
+    async with _chores_lock:
+        d = _chores_read()
+        g = (d.get("bj") or {}).get(req.game_id)
+        if not g or not g.get("active"):
+            raise HTTPException(status_code=404, detail="no active game")
+        g["player"].append(g["deck"].pop())
+        pv = _bj_val(g["player"])
+        if pv > 21:
+            g["active"] = False
+            _chores_write(d)
+            return {"player": g["player"], "player_total": pv, "done": True, "result": "bust",
+                    "dealer": g["dealer"], "dealer_total": _bj_val(g["dealer"]), "payout": 0}
+        _chores_write(d)
+    return {"player": g["player"], "player_total": pv, "done": False}
+
+
+@app.post("/chores/bj/stand")
+async def bj_stand(req: BjGame):
+    async with _chores_lock:
+        d = _chores_read()
+        g = (d.get("bj") or {}).get(req.game_id)
+        if not g or not g.get("active"):
+            raise HTTPException(status_code=404, detail="no active game")
+        while _bj_val(g["dealer"]) < 17:
+            g["dealer"].append(g["deck"].pop())
+        pv, dv = _bj_val(g["player"]), _bj_val(g["dealer"])
+        win = dv > 21 or pv > dv                          # dealer wins ties
+        payout = g["wager"] * 2 if win else 0
+        kid = g["kid"]
+        if win:
+            _bj_win_log(d, kid, "🃏 Blackjack WIN +%d" % payout, payout)
+        g["active"] = False
+        new_total = sum(int(e.get("points", 0)) for e in d["log"][kid])
+        _chores_write(d)
+    return {"player": g["player"], "dealer": g["dealer"], "player_total": pv, "dealer_total": dv,
+            "done": True, "result": "win" if win else "lose", "payout": payout, "new_total": new_total}
 
 
 # ========================================================== voice intents
