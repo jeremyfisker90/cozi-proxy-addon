@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.20.9
+- Mines and Blackjack are now DEMO-ONLY: their /start endpoints refuse (403) so
+  no real points can be staked. Real-points play is limited to Slots and the
+  Wheel (both true 75% house). Demo play is client-side and unaffected.
+
+## 1.20.8
+- Odds tuning to keep the house ahead: Mines is now 7 bombs / 2 gems (payouts
+  2.5x, 8x) so a first flip survives only ~22% (~78% house). Blackjack now also
+  pushes on a dealer 22 (dealer only busts at 23+), nudging the edge up.
+
 ## 1.20.7
 - Blackjack: `POST /chores/bj/{start,hit,stand}`. Hit/stand against the dealer;
   house-favored rules (dealer draws to 17 and wins ties, blackjack pays even

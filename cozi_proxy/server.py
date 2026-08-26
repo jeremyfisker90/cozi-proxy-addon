@@ -1526,8 +1526,8 @@ async def chores_gamble(req: ChoreGamble):
 # 9 tiles, 4 mines. Payouts are BELOW fair on purpose so the house keeps its edge
 # (fair 2-gem ~3.6x, we pay 2x). Mine positions live only on the server.
 MINES_TILES = 9
-MINES_COUNT = 4
-MINES_MULTS = [1.3, 2.0, 3.3, 6.0, 13.0]   # multiplier after 1..5 gems found
+MINES_COUNT = 7                            # 7 bombs, only 2 gems -> ~78% house
+MINES_MULTS = [2.5, 8.0]                   # multiplier after 1..2 gems found
 
 
 class MinesStart(BaseModel):
@@ -1546,6 +1546,9 @@ class MinesGame(BaseModel):
 
 @app.post("/chores/mines/start")
 async def mines_start(req: MinesStart):
+    # Mines is DEMO-ONLY (played client-side with fake points); real points
+    # can never be staked on it.
+    raise HTTPException(status_code=403, detail="Mines is demo-only — no real points.")
     import random
     import time
     kid = req.kid.lower()
@@ -1675,6 +1678,8 @@ def _bj_win_log(d, kid, name, pts):
 
 @app.post("/chores/bj/start")
 async def bj_start(req: BjStart):
+    # Blackjack is DEMO-ONLY (client-side, fake points); no real points at stake.
+    raise HTTPException(status_code=403, detail="Blackjack is demo-only — no real points.")
     import time
     kid = req.kid.lower()
     if kid not in ("ian", "evan"):
@@ -1747,7 +1752,8 @@ async def bj_stand(req: BjGame):
         while _bj_val(g["dealer"]) < 17:
             g["dealer"].append(g["deck"].pop())
         pv, dv = _bj_val(g["player"]), _bj_val(g["dealer"])
-        win = dv > 21 or pv > dv                          # dealer wins ties
+        # dealer wins ties AND pushes on 22 (dealer only truly busts at 23+)
+        win = dv >= 23 or (dv <= 21 and pv > dv)
         payout = g["wager"] * 2 if win else 0
         kid = g["kid"]
         if win:
