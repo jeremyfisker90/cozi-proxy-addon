@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.20.6
+- Queue expiry: a chore a KID grabs into their own queue (`queued_by: self`)
+  falls back onto the board if it's still unfinished 24h later. A chore a PARENT
+  assigns or an ad-hoc/rejected redo (`queued_by: parent`) stays in the kid's
+  queue until it's actually done. Swept on the periodic roll.
+
 ## 1.20.5
 - Mines game: `POST /chores/mines/{start,pick,cashout}`. Stake a bet, reveal gems
   on a 9-tile board (4 mines) for a rising multiplier, cash out before you hit a

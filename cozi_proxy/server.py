@@ -705,6 +705,8 @@ def _roll_week(d, on=None):
         c["done_by"] = None
         c.pop("rejected", None)
         c["queued_for"] = "na"       # queues start fresh each week
+        c.pop("queued_at", None)
+        c.pop("queued_by", None)
     d["log"] = {"ian": [], "evan": []}
     d["week_start"] = _monday(on).isoformat()
     _repost(d, on)
@@ -728,9 +730,35 @@ def _roll_daily(d, on=None):
     return n
 
 
+QUEUE_TTL_SEC = 24 * 3600
+
+
+def _expire_queues(d):
+    """A job a KID grabbed for themselves (queued_by 'self') falls back onto the
+    board if it sits unfinished in their queue longer than 24h. A job a PARENT
+    assigned (queued_by 'parent') stays in the queue until it's done."""
+    import time
+    now = time.time()
+    n = 0
+    for c in d["chores"]:
+        if (c.get("queued_for", "na") in ("ian", "evan")
+                and not c.get("done_by")
+                and c.get("queued_by") == "self"):
+            at = c.get("queued_at")
+            if not isinstance(at, (int, float)):
+                c["queued_at"] = now                 # safety: start the clock
+                continue
+            if now - at > QUEUE_TTL_SEC:
+                c["queued_for"] = "na"
+                c.pop("queued_at", None)
+                c.pop("queued_by", None)
+                n += 1
+    return n
+
+
 def _maybe_roll(d):
-    """Auto-advance on Monday, reopen dailies each morning, and run the
-    duplicate-tidy pass; catches up if the box was off."""
+    """Auto-advance on Monday, reopen dailies each morning, expire stale self-
+    grabbed queue items, and run the duplicate-tidy pass; catches up if off."""
     today = _today()
     this_monday = _monday(today)
     ws = _parse_date(d.get("week_start") or "")
@@ -739,6 +767,8 @@ def _maybe_roll(d):
         _roll_week(d, today)
         changed = True
     elif _roll_daily(d) > 0:
+        changed = True
+    if _expire_queues(d) > 0:
         changed = True
     if _dedupe(d):
         _repost(d, today)
@@ -1117,7 +1147,7 @@ async def chores_adhoc(req: ChoreAdHoc):
         c = {"id": cid, "name": req.name.strip(),
              "points": int(req.points), "description": (req.description or "").strip(),
              "kind": "required", "frequency": "once", "assigned_to": kid,
-             "queued_for": kid, "last_done": None, "posted": True,
+             "queued_for": kid, "queued_by": "parent", "last_done": None, "posted": True,
              "done_by": None, "source": "adhoc"}
         d["chores"].append(c)
         d["next_id"] = cid + 1
@@ -1197,6 +1227,13 @@ async def chores_queue(req: ChoreClaim):
         if c.get("done_by"):
             raise HTTPException(status_code=409, detail="already completed")
         c["queued_for"] = kid
+        if kid == "na":                       # released back to the board
+            c.pop("queued_at", None)
+            c.pop("queued_by", None)
+        else:                                 # kid grabbed it -> 24h clock starts
+            import time
+            c["queued_by"] = "self"
+            c["queued_at"] = time.time()
         _chores_write(d)
     return {"status": "ok", "queued_for": kid}
 
@@ -1259,6 +1296,8 @@ async def chores_assign(req: ChoreClaim):
             raise HTTPException(status_code=404, detail="chore not found")
         c["assigned_to"] = kid
         c["queued_for"] = kid        # parent assignment lands in the kid's queue
+        c["queued_by"] = "parent"    # parent-assigned -> stays put until done
+        c.pop("queued_at", None)
         _chores_write(d)
     body = "You need to do this chore now: " + c["name"]
     if c.get("description"):
@@ -1334,6 +1373,8 @@ async def chores_reject(req: ChoreReject):
         c["done_by"] = None
         c["posted"] = True
         c["queued_for"] = kid                   # back into the offender's queue
+        c["queued_by"] = "parent"               # a forced redo stays until it's done
+        c.pop("queued_at", None)
         c["rejected"] = {
             "kid": kid,
             "comment": (req.comment or "").strip(),
