@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.2.0
+- Chore alerts now go out as Home Assistant Companion push in addition to the
+  text. Carrier email-to-SMS is being retired (AT&T shut down June 2025,
+  T-Mobile Dec 2024, Verizon vtext.com completes 2027-03-31) and already drops
+  messages silently, so every alert takes both paths and either one failing no
+  longer loses the notification.
+- Push reaches phones away from home: HA opens an OUTGOING connection to
+  FCM/APNS, so there is no port forwarding, no VPN and no Nabu Casa involved.
+- Uses SUPERVISOR_TOKEN via the existing `homeassistant_api: true`, so there is
+  no long-lived token to mint, store or rotate.
+- New options: `push_mom`, `push_dad`, `push_ian`, `push_evan` (notify service
+  names without the `notify.` prefix; blank disables) and `push_parents_both`,
+  which pushes parent-facing alerts to both parents while the text keeps its
+  single recipient.
+
 ## 1.20.9
 - Mines and Blackjack are now DEMO-ONLY: their /start endpoints refuse (403) so
   no real points can be staked. Real-points play is limited to Slots and the

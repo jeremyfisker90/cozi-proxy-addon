@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from cozi import Cozi
 from cozi.exceptions import InvalidLoginException, CoziException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 import aiohttp
 
 app = FastAPI(title="Cozi Proxy")
@@ -87,6 +87,7 @@ async def startup_event():
     logging.getLogger("cozi").setLevel(logging.WARNING)
     logging.getLogger().setLevel(logging.INFO)
     _load_sms_options()
+    _load_push_options()
     _load_mirror_options()
     await auto_login()
     asyncio.create_task(_sync_loop())      # keeps chores reconciled with Cozi + sheet
@@ -287,7 +288,7 @@ async def reorder_lists(req: ReorderListsRequest):
     except Exception as ex:
         raise HTTPException(status_code=500, detail=str(ex))
 
-# ====================== CHORES / POINTS ======================
+# ====================== CHORES / points ======================
 # Local JSON is the store; Cozi lists and an optional published-CSV spreadsheet are
 # additional INPUT channels that stay reconciled with it. Chores are matched across
 # all three sources by normalised name, so the same chore never lands twice.
@@ -307,11 +308,18 @@ _chores_lock = asyncio.Lock()
 
 COZI_LISTS = {"chores required": "required", "chores optional": "optional"}
 SYNC_EVERY = 300  # seconds
+# Hard ceiling on one reconcile pass. Without it a hung Google/Cozi call
+# parks the loop task forever and the board silently stops following the
+# spreadsheet until the add-on restarts (this is what happened to the Keep
+# loop: 199-hour gaps against a 60-second poll).
+SYNC_TIMEOUT = 240
+SYNCSTAT = {"attempted": "", "ok": "", "cycles": 0, "timeouts": 0, "err": ""}
 
-FREQ_DAYS = {"daily": 1, "weekly": 7, "bi-weekly": 14, "biweekly": 14, "monthly": 30,
+FREQ_DAYS = {"daily": 1, "2-day": 2, "weekly": 7, "bi-weekly": 14, "biweekly": 14,
+             "monthly": 30,
              "once": 3650}   # one-off (ad-hoc): effectively never reposts once done
-FREQ_CANON = {"daily": "daily", "weekly": "weekly", "bi-weekly": "bi-weekly",
-              "biweekly": "bi-weekly", "monthly": "monthly"}
+FREQ_CANON = {"daily": "daily", "2-day": "2-day", "weekly": "weekly",
+              "bi-weekly": "bi-weekly", "biweekly": "bi-weekly", "monthly": "monthly"}
 DEFAULT_FREQ = "weekly"
 
 # Who a chore belongs to. "na" = nobody in particular, anyone can grab it.
@@ -380,7 +388,7 @@ async def _send_sms(who, body):
 
 
 def _sms_number(value):
-    """'(513) 417-7196', '15134177196' -> '5134177196'. None if it isn't a
+    """'(555) 123-4567', '15551234567' -> '5551234567'. None if it isn't a
     10-digit US number. A name (ian/evan/mom/dad) resolves to that phone."""
     v = (value or "").strip().lower()
     if v in SMS["phones"]:
@@ -408,6 +416,94 @@ async def _send_sms_raw(number, body, gateway=None):
     return await asyncio.to_thread(_send_sms_raw_sync, number, body, gateway)
 
 
+# --- Home Assistant Companion push -----------------------------------------
+# Carrier email-to-SMS is going away: AT&T shut down June 2025, T-Mobile
+# December 2024, and Verizon's vtext.com completes its shutdown 2027-03-31 and
+# already drops messages silently (the SMTP handoff succeeds, no text arrives,
+# no bounce). So every text now also goes out as a Companion-app push.
+#
+# Push reaches phones away from home: HA makes an OUTGOING connection to
+# FCM/APNS and Google/Apple deliver. No port forwarding, no VPN, no Nabu Casa.
+#
+# The add-on sets homeassistant_api: true, so SUPERVISOR_TOKEN can call core
+# directly - there is no long-lived token to mint or rotate.
+PUSH = {"services": {}, "parents_both": True}
+
+_PUSH_DEFAULTS = {
+    "mom": "mobile_app_mom_phone",
+    "dad": "mobile_app_dad_phone",
+    "ian": "",
+    "evan": "",
+}
+
+
+def _load_push_options():
+    try:
+        with open("/data/options.json") as f:
+            o = json.load(f)
+    except Exception:
+        o = {}
+    svcs = {}
+    for who, default in _PUSH_DEFAULTS.items():
+        v = o.get("push_" + who)
+        svcs[who] = (default if v is None else str(v)).strip()
+    PUSH["services"] = svcs
+    PUSH["parents_both"] = bool(o.get("push_parents_both", True))
+    on = [w for w, s in svcs.items() if s]
+    if os.environ.get("SUPERVISOR_TOKEN"):
+        print("PUSH: companion-app notifications enabled for %s" % (on or "nobody"))
+    else:
+        print("PUSH: disabled (no SUPERVISOR_TOKEN - is homeassistant_api set?)")
+
+
+async def _send_push(who, body, title="El Dashboardio", tag=None):
+    """One Companion-app notification. Never raises; returns True on delivery
+    to HA (not to the handset - FCM is fire and forget)."""
+    svc = PUSH["services"].get(who)
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not svc or not token:
+        return False
+    payload = {"title": title, "message": body}
+    if tag:
+        # A repeat of the same alert replaces the old one instead of stacking.
+        payload["data"] = {"tag": tag}
+    url = "http://supervisor/core/api/services/notify/%s" % svc
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json=payload,
+                              headers={"Authorization": "Bearer %s" % token},
+                              timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status < 300:
+                    print("PUSH sent to %s: %s" % (who, body[:70]))
+                    return True
+                print("PUSH to %s FAILED: HTTP %s" % (who, r.status))
+    except Exception as e:
+        print("PUSH to %s FAILED: %s" % (who, e))
+    return False
+
+
+async def _notify(who, body, title="El Dashboardio", tag=None):
+    """Text AND push, concurrently. One path failing never blocks the other -
+    that redundancy is the whole point while vtext is dying."""
+    sms, push = await asyncio.gather(
+        _send_sms(who, body),
+        _send_push(who, body, title, tag),
+        return_exceptions=True,
+    )
+    return bool(sms is True or push is True)
+
+
+async def _notify_parents(body, title="El Dashboardio", tag=None):
+    """Parent-facing alerts. The text keeps its existing single recipient (mom);
+    push goes to both parents so either can act on it."""
+    tasks = [_notify("mom", body, title, tag)]
+    if PUSH["parents_both"]:
+        tasks.append(_send_push("dad", body, title, tag))
+    res = await asyncio.gather(*tasks, return_exceptions=True)
+    return bool(any(r is True for r in res))
+
+
+
 def _now_local():
     try:
         from zoneinfo import ZoneInfo
@@ -426,7 +522,8 @@ def _stamp(dt):
 
 
 def _person(value):
-    v = re.sub(r"[^a-z]", "", (value or "").lower())
+    # keep digits: "2-day" must not collapse to "day" (which read as "daily")
+    v = re.sub(r"[^a-z0-9]", "", (value or "").lower())
     if not v:
         return "na"
     for p in PEOPLE:
@@ -434,7 +531,7 @@ def _person(value):
             return p
     if v.startswith("ash"):        # Mom by name
         return "mom"
-    if v.startswith("tom"):        # Dad by name
+    if v.startswith("dad"):        # Dad by name
         return "dad"
     if v in ("none", "anyone", "any", "unassigned"):
         return "na"
@@ -442,9 +539,15 @@ def _person(value):
 
 
 def _freq(value):
-    v = re.sub(r"[^a-z]", "", (value or "").lower())
+    # keep digits: "2-day" must not collapse to "day", which reads as "daily"
+    v = re.sub(r"[^a-z0-9]", "", (value or "").lower())
     if v.startswith("da") or v.startswith("everyday") or v.startswith("eachday"):
         return "daily"
+    # every-other-day. Checked before bi-weekly because "every2days" also
+    # starts with "every2", which bi-weekly would otherwise swallow.
+    if (v.startswith("2day") or v.startswith("twoday") or v.startswith("every2day")
+            or v.startswith("everyotherday") or v.startswith("everysecondday")):
+        return "2-day"
     if v.startswith("bi") or v.startswith("every2") or v.startswith("fort"):
         return "bi-weekly"
     if v.startswith("mo"):
@@ -462,6 +565,17 @@ def _today():
     return datetime.date.today()
 
 
+ROLL_HOUR = 6      # chores "day" starts at 6am, not midnight
+
+
+def _chore_day(now=None):
+    """The chore board's idea of today. Before 6am it is still yesterday, so a
+    daily chore finished last night doesn't reopen until 6am."""
+    now = now or _now_local()
+    d = now.date()
+    return d if now.hour >= ROLL_HOUR else d - datetime.timedelta(days=1)
+
+
 def _monday(d):
     return d - datetime.timedelta(days=d.weekday())
 
@@ -474,7 +588,8 @@ def _parse_date(s):
 
 
 def _chores_default():
-    return {"target": 100, "chores": [], "log": {"ian": [], "evan": []}, "week_start": None,
+    return {"target": 100, "chores": [], "log": {"ian": [], "evan": [], "parent": []},
+            "claims": [], "next_claim": 1, "week_start": None,
             "next_id": 1, "sheet_url": "", "last_sync": None, "sync_error": "", "sync_note": "",
             "history": [], "rejections": [], "schema": 0}
 
@@ -489,6 +604,11 @@ def _chores_read():
         base.update(d or {})
         base.setdefault("log", {}).setdefault("ian", [])
         base["log"].setdefault("evan", [])
+        # parents bank points too, but in their own bucket. Nothing that decides
+        # the champion or the optional-unlock credits ever reads this key.
+        base["log"].setdefault("parent", [])
+        base.setdefault("claims", [])
+        base.setdefault("next_claim", 1)
         for c in base.get("chores", []):          # migrate older rows
             c.setdefault("kind", "required")
             c.setdefault("source", "dashboard")
@@ -499,6 +619,11 @@ def _chores_read():
             c.setdefault("assigned_to", "na")
             # kid work queue — LOCAL ONLY, never overwritten by sheet/Cozi sync
             c.setdefault("queued_for", "na")
+            # parent sign-off. Chores finished before this feature existed are
+            # grandfathered in as approved so nobody's history empties out.
+            if c.get("done_by") and "approved" not in c:
+                c["approved"] = True
+            c.setdefault("approved", False)
         return base
     except Exception:
         return _chores_default()
@@ -540,8 +665,8 @@ def _dedupe(d):
         a, b = seen[k], c
 
         def _rank(x):
-            return (bool(x.get("done_by")), x.get("queued_for", "na") != "na",
-                    bool(x.get("from_sheet")))
+            claimed = any(cl["chore_id"] == x.get("id") for cl in d.get("claims", []))
+            return (claimed, bool(x.get("from_sheet")))
         winner, loser = (a, b) if _rank(a) >= _rank(b) else (b, a)
         if winner is b:
             keep[keep.index(a)] = b
@@ -650,115 +775,84 @@ def _is_due(c, on=None):
     return True if d is None else d <= (on or _today())
 
 
-def _repost(d, on=None):
-    """Decide what sits on the board. Unfinished chores stay up; completed ones
-    come back only once their frequency interval has elapsed."""
-    on = on or _today()
-    for c in d["chores"]:
-        # a chore sent back by a parent stays up until it's redone
-        c["posted"] = True if c.get("rejected") else _is_due(c, on)
 
 
-def _credits(chores, kid):
-    """A kid's optional-unlock balance: each REQUIRED chore they finish unlocks
-    one optional; each OPTIONAL they finish spends one. 1 required = 1 optional,
-    rolling all week (resets when the weekly roll clears done_by)."""
-    rq = sum(1 for c in chores
-             if c.get("kind", "required") == "required" and c.get("done_by") == kid)
-    op = sum(1 for c in chores
-             if c.get("kind") == "optional" and c.get("done_by") == kid)
-    return rq - op
 
 
 def _gate(chores):
-    """Board state. Optional chores are unlocked per-kid on a 1-required-unlocks-
-    1-optional basis (see _credits); `optional_unlocked` is true if either kid
-    currently has an unlock to spend."""
-    req = [c for c in chores
-           if c.get("kind", "required") == "required" and c.get("posted", True)]
-    left = [c for c in req if not c.get("done_by")]
-    credits = {k: max(0, _credits(chores, k)) for k in ("ian", "evan")}
-    return {"required_total": len(req), "required_left": len(left),
-            "optional_credits": credits,
-            "optional_unlocked": any(v > 0 for v in credits.values())}
+    """Required/Optional is a priority label now, not a lock. The unlock gate
+    counted chores whose done_by the daily roll cleared every morning, so it
+    never worked the way its docstring claimed; nothing gates a claim today."""
+    req = [c for c in chores if c.get("kind", "required") == "required"]
+    return {"required_total": len(req), "required_left": len(req),
+            "optional_credits": {"ian": 0, "evan": 0},
+            "optional_unlocked": True}
+
+
+CLAIM_OPEN = ("queued", "done")
+
+
+def _claims_for(d, kid=None, state=None, chore_id=None):
+    out = []
+    for cl in d.get("claims", []):
+        if kid is not None and cl.get("kid") != kid:
+            continue
+        if state is not None and cl.get("state") != state:
+            continue
+        if chore_id is not None and cl.get("chore_id") != chore_id:
+            continue
+        out.append(cl)
+    return out
+
+
+def _pending_points(d):
+    """Claimed and finished, still waiting on a parent. Shown next to the banked
+    total so a kid can see the work is counted, just not signed off yet."""
+    out = {}
+    for kid in ("ian", "evan", "parent"):
+        out[kid] = sum(int(c.get("points", 0))
+                       for c in _claims_for(d, kid=kid, state="done"))
+    return out
 
 
 def _roll_week(d, on=None):
     """Close out the week: stamp completions, clear the board, re-post what's due."""
     on = on or _today()
-    done = [c for c in d["chores"] if c.get("done_by")]
-    for c in done:
-        c["last_done"] = on.isoformat()
+    # Approved claims are the week's record now; the chores themselves never
+    # changed state, so there is nothing on them to stamp.
+    done = _claims_for(d, state="approved")
     if done:
         d.setdefault("history", []).append({
             "week_start": d.get("week_start"),
             "closed": on.isoformat(),
             "totals": {k: sum(int(e.get("points", 0)) for e in v) for k, v in d["log"].items()},
-            "completed": [{"name": c["name"], "by": c["done_by"],
+            "completed": [{"name": c["name"], "by": c["kid"],
                            "points": c.get("points", 0)} for c in done],
         })
         d["history"] = d["history"][-52:]          # keep a year
-    # one-off ad-hoc chores that got done just disappear; they don't repost
+    # a one-off that somebody actually finished has served its purpose
+    finished_once = {c["chore_id"] for c in done}
     d["chores"] = [c for c in d["chores"]
-                   if not (c.get("frequency") == "once" and c.get("done_by"))]
-    for c in d["chores"]:
-        c["done_by"] = None
-        c.pop("rejected", None)
-        c["queued_for"] = "na"       # queues start fresh each week
-        c.pop("queued_at", None)
-        c.pop("queued_by", None)
-    d["log"] = {"ian": [], "evan": []}
+                   if not (c.get("frequency") == "once" and c["id"] in finished_once)]
+    d["claims"] = []
+    d["log"] = {"ian": [], "evan": [], "parent": []}
     d["week_start"] = _monday(on).isoformat()
-    _repost(d, on)
     return len(done)
 
 
-def _roll_daily(d, on=None):
-    """Daily chores reopen every morning; the points already banked stay banked."""
-    on = on or _today()
-    n = 0
-    for c in d["chores"]:
-        if c.get("frequency") != "daily" or not c.get("done_by"):
-            continue
-        done_on = _parse_date(c.get("done_on") or "") or _parse_date(d.get("week_start") or "")
-        if done_on and done_on < on:
-            c["last_done"] = done_on.isoformat()
-            c["done_by"] = None
-            c.pop("rejected", None)
-            c["posted"] = True
-            n += 1
-    return n
+
+
 
 
 QUEUE_TTL_SEC = 24 * 3600
 
 
-def _expire_queues(d):
-    """A job a KID grabbed for themselves (queued_by 'self') falls back onto the
-    board if it sits unfinished in their queue longer than 24h. A job a PARENT
-    assigned (queued_by 'parent') stays in the queue until it's done."""
-    import time
-    now = time.time()
-    n = 0
-    for c in d["chores"]:
-        if (c.get("queued_for", "na") in ("ian", "evan")
-                and not c.get("done_by")
-                and c.get("queued_by") == "self"):
-            at = c.get("queued_at")
-            if not isinstance(at, (int, float)):
-                c["queued_at"] = now                 # safety: start the clock
-                continue
-            if now - at > QUEUE_TTL_SEC:
-                c["queued_for"] = "na"
-                c.pop("queued_at", None)
-                c.pop("queued_by", None)
-                n += 1
-    return n
 
 
 def _maybe_roll(d):
-    """Auto-advance on Monday, reopen dailies each morning, expire stale self-
-    grabbed queue items, and run the duplicate-tidy pass; catches up if off."""
+    """Only the scoring week rolls now. Chores no longer go anywhere, so there
+    are no dailies to reopen, nothing to re-post, and no stale queue items to
+    expire - an unfinished claim is just work the kid hasn't done yet."""
     today = _today()
     this_monday = _monday(today)
     ws = _parse_date(d.get("week_start") or "")
@@ -766,12 +860,7 @@ def _maybe_roll(d):
     if ws is None or ws < this_monday:
         _roll_week(d, today)
         changed = True
-    elif _roll_daily(d) > 0:
-        changed = True
-    if _expire_queues(d) > 0:
-        changed = True
     if _dedupe(d):
-        _repost(d, today)
         changed = True
     return changed
 
@@ -853,6 +942,7 @@ async def _from_sheet(url):
                             "description": val(row, "description"),
                             "kind": kind, "source": "sheet",
                             "frequency": _freq(val(row, "frequency")),
+                            "room": val(row, "room").strip(),
                             "assigned_to": _person(val(row, "assigned"))}
     return out, ""
 
@@ -881,6 +971,7 @@ def _map_columns(fieldnames):
     claim("assigned", "assign", "who", "owner", "person", "whose")
     claim("frequency", "frequen", "how often", "repeat", "cadence", "schedule")
     claim("description", "detail", "step", "descri", "how", "note", "instruction")
+    claim("room", "room", "area", "location", "where", "zone")
     claim("points", "point", "pts", "value", "worth")
     claim("kind", "type", "kind", "required", "optional", "categ")
     claim("name", "chore", "task", "job", "title", "name")
@@ -926,6 +1017,10 @@ async def _do_sync():
                           "description": _merge_desc(c.get("description"), e["description"]),
                           "kind": e["kind"],
                           "assigned_to": e.get("assigned_to", c.get("assigned_to", "na"))})
+                # Cozi rows carry no room, so an empty one must not wipe the
+                # sheet's value on a later Cozi-only pass.
+                if e.get("room"):
+                    c["room"] = e["room"]
                 if e.get("frequency"):
                     c["frequency"] = e["frequency"]
                 if key in sheet_items:
@@ -937,6 +1032,7 @@ async def _do_sync():
                 d["next_id"] = cid + 1
                 nc = {"id": cid, "name": e["name"], "points": e["points"],
                       "description": e["description"], "kind": e["kind"],
+                      "room": e.get("room", ""),
                       "frequency": e.get("frequency") or DEFAULT_FREQ,
                       "last_done": None, "posted": True,
                       "from_sheet": key in sheet_items,
@@ -984,7 +1080,9 @@ async def _do_sync():
                 # goes away even though Cozi still mirrors the old name
                 sheet_dropped = sheet_ok and c.get("from_sheet") and key not in sheet_items
                 gone = c.get("source") in ("cozi", "sheet") and key not in ext
-                if (gone or sheet_dropped) and not c.get("done_by"):
+                held = any(cl["state"] in CLAIM_OPEN
+                           for cl in _claims_for(d, chore_id=c["id"]))
+                if (gone or sheet_dropped) and not held:
                     if key in cozi_item_ids:
                         drop_from_cozi.append(cozi_item_ids[key])
                     continue
@@ -1000,9 +1098,7 @@ async def _do_sync():
                     and _norm(c["name"]) not in cozi_items):
                 push.append((list_ids[c["kind"]], _fmt_item(c)))
 
-        rolled = _maybe_roll(d)
-        if not rolled:
-            _repost(d)
+        _maybe_roll(d)
         d["last_sync"] = datetime.datetime.now().isoformat(timespec="seconds")
         d["sync_error"] = cozi_err or sheet_err or ""
         d["sync_note"] = "cozi:%d sheet:%d" % (len(cozi_items), len(sheet_items))
@@ -1043,8 +1139,17 @@ async def _do_sync():
 async def _sync_loop():
     while True:
         try:
-            await _sync_chores()
+            SYNCSTAT["attempted"] = _now_local().isoformat(timespec="seconds")
+            SYNCSTAT["cycles"] += 1
+            await asyncio.wait_for(_sync_chores(), timeout=SYNC_TIMEOUT)
+            SYNCSTAT["ok"] = _now_local().isoformat(timespec="seconds")
+            SYNCSTAT["err"] = ""
+        except asyncio.TimeoutError:
+            SYNCSTAT["timeouts"] += 1
+            SYNCSTAT["err"] = "sync timed out after %ds" % SYNC_TIMEOUT
+            print("chores sync:", SYNCSTAT["err"])
         except Exception as ex:
+            SYNCSTAT["err"] = str(ex)
             print("chores sync failed:", ex)
         await asyncio.sleep(SYNC_EVERY)
 
@@ -1056,6 +1161,9 @@ class ChoreAdd(BaseModel):
     kind: str = "required"
     frequency: str = DEFAULT_FREQ
     assigned_to: str = "na"
+    # Without a room a dashboard-added chore falls into the board's "no room"
+    # bucket instead of sitting with its neighbours.
+    room: str = ""
 
 class ChoreEdit(BaseModel):
     id: int
@@ -1065,6 +1173,7 @@ class ChoreEdit(BaseModel):
     kind: str | None = None
     frequency: str | None = None
     assigned_to: str | None = None
+    room: str | None = None
 
 class ChoreId(BaseModel):
     id: int
@@ -1085,11 +1194,181 @@ class SheetUrl(BaseModel):
 
 
 def _decorate(c):
+    """Chores are always on the board now, so there is no due date to compute.
+    posted stays true for older clients that still read it."""
     out = dict(c)
-    dd = _due_date(c)
-    out["next_due"] = dd.isoformat() if dd else None
-    out["days_until_due"] = max(0, (dd - _today()).days) if dd else 0
+    out["posted"] = True
+    out["next_due"] = None
+    out["days_until_due"] = 0
     return out
+
+
+# ---------------------------------------------------------------- meal list
+# The family's approved dinners live on the "Meals" tab of the same published
+# workbook as the chores: column A = meal, B = Pre-Time (Fast/Normal),
+# C = Last cooked. Cached briefly so tapping through the planner doesn't hammer
+# Google on every render.
+MEALS_CACHE = {"at": 0.0, "rows": [], "err": "", "ttl": 300}
+
+
+def _meals_url(d=None):
+    d = d if d is not None else _chores_read()
+    u = (d.get("meals_url") or "").strip()
+    if u:
+        return u
+    # fall back to the chores sheet URL with the Meals gid swapped in, which
+    # works when the whole workbook is published rather than a single tab
+    base = (d.get("sheet_url") or "").strip()
+    if base and "gid=" in base:
+        return re.sub(r"gid=\d+", "gid=1210459301", base)
+    return ""
+
+
+async def _meals_fetch(force=False):
+    import time
+    if not force and MEALS_CACHE["rows"] and (time.time() - MEALS_CACHE["at"]) < MEALS_CACHE["ttl"]:
+        return MEALS_CACHE["rows"]
+    url = _meals_url()
+    if not url:
+        MEALS_CACHE["err"] = "no meals sheet configured"
+        return []
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status >= 400:
+                    raise RuntimeError("HTTP %d (is the Meals tab published?)" % r.status)
+                text = await r.text()
+    except Exception as e:
+        MEALS_CACHE["err"] = str(e)[:160]
+        return MEALS_CACHE["rows"]          # serve stale rather than nothing
+    rows, seen = [], set()
+    for i, raw in enumerate(csv.reader(io.StringIO(text))):
+        if i == 0 or not raw:
+            continue
+        name = (raw[0] if len(raw) > 0 else "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        pre = (raw[1] if len(raw) > 1 else "").strip()
+        rows.append({"name": name,
+                     "fast": pre.lower().startswith("fast"),
+                     "pre_time": pre,
+                     "last_cooked": (raw[2] if len(raw) > 2 else "").strip()})
+    rows.sort(key=lambda m: m["name"].lower())
+    MEALS_CACHE.update({"at": time.time(), "rows": rows, "err": ""})
+    return rows
+
+
+@app.get("/meals")
+async def meals_get(refresh: bool = False):
+    rows = await _meals_fetch(force=refresh)
+    return {"meals": rows, "count": len(rows),
+            "fast_count": sum(1 for m in rows if m["fast"]),
+            "error": MEALS_CACHE["err"], "url_set": bool(_meals_url())}
+
+
+class MealsUrl(BaseModel):
+    url: str
+
+
+@app.post("/meals/url")
+async def meals_set_url(req: MealsUrl):
+    async with _chores_lock:
+        d = _chores_read()
+        d["meals_url"] = (req.url or "").strip()
+        _chores_write(d)
+    MEALS_CACHE["rows"] = []
+    rows = await _meals_fetch(force=True)
+    return {"status": "ok", "count": len(rows), "error": MEALS_CACHE["err"]}
+
+
+# ---------------------------------------------------------------- meal tracker
+# What actually got cooked, kept in the add-on's own store. The workbook is
+# published read-only so there is no write path to the Tracker tab; this is the
+# source of truth and /meals/tracker.csv produces rows to paste in when wanted.
+class MealTrack(BaseModel):
+    meal: str
+    day: str = ""
+    date: str = ""          # ISO yyyy-mm-dd; defaults to today
+
+
+class MealRate(BaseModel):
+    date: str
+    meal: str = ""
+    rating: str = ""        # 'up' | 'down' | ''
+    notes: str = ""
+
+
+def _meal_log(d):
+    return d.setdefault("meal_log", [])
+
+
+@app.post("/meals/track")
+async def meals_track(req: MealTrack):
+    """Record that a meal was cooked on a date. Upserts on the date so changing
+    your mind about a day replaces the entry instead of stacking duplicates."""
+    meal = (req.meal or "").strip()
+    date = (req.date or "").strip() or _today().isoformat()
+    async with _chores_lock:
+        d = _chores_read()
+        log = _meal_log(d)
+        row = next((r for r in log if r.get("date") == date), None)
+        if not meal:                                   # cleared -> drop the row
+            if row:
+                log.remove(row)
+            _chores_write(d)
+            return {"status": "ok", "removed": bool(row)}
+        if row:
+            row.update({"meal": meal, "day": req.day or row.get("day", "")})
+        else:
+            log.append({"meal": meal, "date": date, "day": req.day or "",
+                        "rating": "", "notes": "",
+                        "at": _now_local().isoformat(timespec="seconds")})
+        d["meal_log"] = sorted(log, key=lambda r: r.get("date", ""))[-400:]
+        _chores_write(d)
+    return {"status": "ok", "meal": meal, "date": date}
+
+
+@app.post("/meals/rate")
+async def meals_rate(req: MealRate):
+    """Thumbs up/down plus a note, so the good ones can be promoted to the
+    approved Meals list later."""
+    async with _chores_lock:
+        d = _chores_read()
+        row = next((r for r in _meal_log(d) if r.get("date") == (req.date or "").strip()), None)
+        if not row:
+            raise HTTPException(status_code=404, detail="no tracked meal on that date")
+        if req.rating is not None:
+            row["rating"] = (req.rating or "").strip().lower()
+        if req.notes is not None:
+            row["notes"] = (req.notes or "").strip()
+        _chores_write(d)
+    return {"status": "ok", "row": row}
+
+
+@app.get("/meals/tracker")
+async def meals_tracker():
+    d = _chores_read()
+    log = sorted(_meal_log(d), key=lambda r: r.get("date", ""), reverse=True)
+    approved = {m["name"].lower() for m in (MEALS_CACHE.get("rows") or [])}
+    for r in log:
+        r["on_approved_list"] = r.get("meal", "").lower() in approved
+    return {"tracker": log, "count": len(log)}
+
+
+@app.get("/meals/tracker.csv")
+async def meals_tracker_csv():
+    """Rows shaped for the workbook's Tracker tab: Meal, Date Cooked, Day,
+    Rating, Notes. Paste straight under the header row."""
+    d = _chores_read()
+    log = sorted(_meal_log(d), key=lambda r: r.get("date", ""), reverse=True)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Meal", "Date Cooked", "Day", "Rating", "Notes"])
+    for r in log:
+        w.writerow([r.get("meal", ""), r.get("date", ""), r.get("day", ""),
+                    r.get("rating", ""), r.get("notes", "")])
+    return Response(content=buf.getvalue(), media_type="text/csv")
 
 
 @app.get("/chores")
@@ -1098,11 +1377,17 @@ async def chores_get():
     totals = {k: sum(int(e.get("points", 0)) for e in v) for k, v in d["log"].items()}
     chores = [_decorate(c) for c in d["chores"]]
     out = {"target": d.get("target", 100), "chores": chores, "log": d["log"],
-           "totals": totals, "week_start": d.get("week_start"),
+           "totals": totals, "claims": d.get("claims", []),
+           "pending": _pending_points(d), "week_start": d.get("week_start"),
            "sheet_url": d.get("sheet_url", ""), "last_sync": d.get("last_sync"),
            "sync_error": d.get("sync_error", ""), "sync_note": d.get("sync_note", ""),
            "today": _today().isoformat(),
-           "frequencies": ["daily", "weekly", "bi-weekly", "monthly"],
+           # loop health: if sync_attempted keeps advancing while sync_ok sits
+           # still, the loop is alive and the sheet simply hasn't changed.
+           "sync_attempted": SYNCSTAT["attempted"], "sync_ok": SYNCSTAT["ok"],
+           "sync_cycles": SYNCSTAT["cycles"], "sync_timeouts": SYNCSTAT["timeouts"],
+           "sync_every": SYNC_EVERY,
+           "frequencies": ["daily", "2-day", "weekly", "bi-weekly", "monthly"],
            "people": PEOPLE, "people_labels": PEOPLE_LABEL,
            "cozi_enabled": COZI_ENABLED}
     out.update(_gate(d["chores"]))
@@ -1119,6 +1404,7 @@ async def chores_add(req: ChoreAdd):
                             "kind": "optional" if req.kind == "optional" else "required",
                             "frequency": _freq(req.frequency) or DEFAULT_FREQ,
                             "assigned_to": _person(req.assigned_to),
+                            "room": (req.room or "").strip(),
                             "last_done": None, "posted": True,
                             "done_by": None, "source": "dashboard"})
         d["next_id"] = cid + 1
@@ -1139,8 +1425,8 @@ async def chores_adhoc(req: ChoreAdHoc):
     It's a normal chore (claimable for points) but frequency 'once' so the
     weekly roll drops it instead of reposting."""
     kid = req.kid.lower()
-    if kid not in ("ian", "evan"):
-        raise HTTPException(status_code=400, detail="kid must be ian or evan")
+    if kid not in ("ian", "evan", "parent"):
+        raise HTTPException(status_code=400, detail="kid must be ian, evan or parent")
     async with _chores_lock:
         d = _chores_read()
         cid = d.get("next_id", 1)
@@ -1153,9 +1439,15 @@ async def chores_adhoc(req: ChoreAdHoc):
         d["next_id"] = cid + 1
         _chores_write(d)
     what = c["description"] or c["name"]
-    body = ("Times are tough, cupcake. We need you to do something a little "
-            "different today — we need you to %s (%s pts)." % (what, c["points"]))
-    sent = await _send_sms(kid, body)
+    if kid == "parent":
+        # A parent queueing work for themselves doesn't need the cupcake speech.
+        body = "Added to the parent queue: %s (%s pts)." % (what, c["points"])
+        sent = await _notify_parents(body, title="Parent queue",
+                                     tag="chore_parent_queue")
+    else:
+        body = ("Times are tough, cupcake. We need you to do something a little "
+                "different today — we need you to %s (%s pts)." % (what, c["points"]))
+        sent = await _notify(kid, body, title="New chore", tag="chore_new")
     return {"status": "ok", "id": cid, "sms": sent}
 
 
@@ -1174,7 +1466,8 @@ async def chores_edit(req: ChoreEdit):
                     c["frequency"] = _freq(req.frequency) or DEFAULT_FREQ
                 if req.assigned_to is not None:
                     c["assigned_to"] = _person(req.assigned_to)
-        _repost(d)
+                if req.room is not None:
+                    c["room"] = req.room.strip()
         _chores_write(d)
     return {"status": "ok"}
 
@@ -1217,15 +1510,14 @@ async def chores_queue(req: ChoreClaim):
     """Kid drops a chore into their own work queue (or 'na' to release it).
     No SMS, no code — completing it later is what needs the kid's code."""
     kid = req.kid.lower()
-    if kid not in ("ian", "evan", "na"):
-        raise HTTPException(status_code=400, detail="kid must be ian, evan or na")
+    if kid not in ("ian", "evan", "parent", "na"):
+        raise HTTPException(status_code=400,
+                            detail="kid must be ian, evan, parent or na")
     async with _chores_lock:
         d = _chores_read()
         c = next((x for x in d["chores"] if x["id"] == req.id), None)
         if not c:
             raise HTTPException(status_code=404, detail="chore not found")
-        if c.get("done_by"):
-            raise HTTPException(status_code=409, detail="already completed")
         c["queued_for"] = kid
         if kid == "na":                       # released back to the board
             c.pop("queued_at", None)
@@ -1285,10 +1577,11 @@ async def sms_send(req: SmsSend):
 
 @app.post("/chores/assign")
 async def chores_assign(req: ChoreClaim):
-    """Parent assigns a chore to a kid and texts them to go do it."""
+    """Parent assigns a chore and texts whoever it landed on. 'parent' is a
+    valid destination: some jobs are not a kid's to do."""
     kid = req.kid.lower()
-    if kid not in ("ian", "evan"):
-        raise HTTPException(status_code=400, detail="kid must be ian or evan")
+    if kid not in ("ian", "evan", "parent"):
+        raise HTTPException(status_code=400, detail="kid must be ian, evan or parent")
     async with _chores_lock:
         d = _chores_read()
         c = next((x for x in d["chores"] if x["id"] == req.id), None)
@@ -1299,102 +1592,219 @@ async def chores_assign(req: ChoreClaim):
         c["queued_by"] = "parent"    # parent-assigned -> stays put until done
         c.pop("queued_at", None)
         _chores_write(d)
-    body = "You need to do this chore now: " + c["name"]
+    body = ("Added to the parent queue: " if kid == "parent"
+            else "You need to do this chore now: ") + c["name"]
     if c.get("description"):
         body += " — " + c["description"]
     body += " (%s pts)" % c.get("points", 0)
-    sent = await _send_sms(kid, body)
+    if kid == "parent":
+        sent = await _notify_parents(body, title="Parent queue",
+                                     tag="chore_parent_queue")
+    else:
+        sent = await _notify(kid, body, title="Chore assigned",
+                             tag="chore_assigned")
     return {"status": "ok", "sms": sent}
 
 
 @app.post("/chores/claim")
 async def chores_claim(req: ChoreClaim):
+    """A kid takes a job. This creates a claim; the chore itself is untouched and
+    stays on the board, so the other kid can take the same job the same day."""
     kid = req.kid.lower()
+    if kid not in ("ian", "evan", "parent"):
+        raise HTTPException(status_code=400, detail="kid must be ian, evan or parent")
     async with _chores_lock:
         d = _chores_read()
-        if kid not in d["log"]:
-            d["log"][kid] = []
         target = next((c for c in d["chores"] if c["id"] == req.id), None)
         if not target:
             raise HTTPException(status_code=404, detail="chore not found")
-        if target.get("done_by"):
-            raise HTTPException(status_code=409, detail="already claimed")
-        if not target.get("posted", True):
-            dd = _due_date(target)
-            raise HTTPException(status_code=425,
-                                detail="Not due yet — back on the board %s"
-                                       % (dd.strftime("%b %-d") if dd else "soon"))
-        if target.get("kind", "required") == "optional" and _credits(d["chores"], kid) < 1:
-            lbl = PEOPLE_LABEL.get(kid, kid.title())
-            raise HTTPException(status_code=423,
-                                detail="%s needs to finish a REQUIRED chore first — "
-                                       "each required chore unlocks one optional." % lbl)
-        target["done_by"] = kid
-        target["done_on"] = _today().isoformat()
-        target.pop("rejected", None)          # redone -> clear the parent's note
-        d["log"][kid].append({"chore_id": target["id"], "name": target["name"],
-                              "points": int(target.get("points", 0))})
+        # One open claim each. Repeats are unlimited, but finish the one you have
+        # before taking the same job again, or the queue fills with duplicates.
+        if any(c["state"] in CLAIM_OPEN
+               for c in _claims_for(d, kid=kid, chore_id=req.id)):
+            raise HTTPException(status_code=409,
+                                detail="You already have that one in your queue")
+        cid = d.get("next_claim", 1)
+        d["next_claim"] = cid + 1
+        d.setdefault("claims", []).append({
+            "id": cid, "chore_id": target["id"], "name": target["name"],
+            "points": int(target.get("points", 0)), "kid": kid, "state": "queued",
+            "queued_at": _now_local().isoformat(timespec="seconds"),
+            "on": _today().isoformat(),
+        })
         _chores_write(d)
-    # let Mom know, without holding up the kid's tap
-    kid_label = PEOPLE_LABEL.get(kid, kid.title())
-    asyncio.create_task(_send_sms(
-        "mom", "%s just completed chore [%s] at %s"
-               % (kid_label, target["name"], _stamp(_now_local()))))
+    return {"status": "ok", "claim": cid}
+
+
+@app.post("/chores/done")
+async def chores_done(req: ChoreId):
+    """Kid says they've finished it. Moves the claim into the parent queue; the
+    points stay pending until a parent signs off."""
+    async with _chores_lock:
+        d = _chores_read()
+        cl = next((c for c in d.get("claims", []) if c["id"] == req.id), None)
+        if not cl:
+            raise HTTPException(status_code=404, detail="claim not found")
+        if cl["state"] != "queued":
+            raise HTTPException(status_code=409, detail="that claim isn't open")
+        cl["state"] = "done"
+        cl["done_at"] = _now_local().isoformat(timespec="seconds")
+        cl.pop("rejected", None)
+        _chores_write(d)
+    kid_label = PEOPLE_LABEL.get(cl["kid"], cl["kid"].title())
+    asyncio.create_task(_notify_parents(
+        "%s just completed chore [%s] at %s"
+        % (kid_label, cl["name"], _stamp(_now_local())),
+        title="Chore completed", tag="chore_done"))
+    return {"status": "ok"}
+
+
+@app.post("/chores/parent_done")
+async def chores_parent_done(req: ChoreId):
+    """A parent finishing their own job needs no approval step, so this claims
+    and approves in one move."""
+    async with _chores_lock:
+        d = _chores_read()
+        target = next((c for c in d["chores"] if c["id"] == req.id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="chore not found")
+        cid = d.get("next_claim", 1)
+        d["next_claim"] = cid + 1
+        now = _now_local().isoformat(timespec="seconds")
+        d.setdefault("claims", []).append({
+            "id": cid, "chore_id": target["id"], "name": target["name"],
+            "points": int(target.get("points", 0)), "kid": "parent",
+            "state": "approved", "queued_at": now, "done_at": now,
+            "approved_at": now, "on": _today().isoformat(),
+        })
+        d["log"].setdefault("parent", []).append({
+            "chore_id": target["id"], "claim_id": cid, "name": target["name"],
+            "points": int(target.get("points", 0)),
+            "on": _today().isoformat(), "at": now,
+        })
+        _chores_write(d)
     return {"status": "ok"}
 
 
 @app.post("/chores/unclaim")
 async def chores_unclaim(req: ChoreId):
+    """Kid drops a claim. Nothing was banked, so the row just goes away."""
     async with _chores_lock:
         d = _chores_read()
-        for c in d["chores"]:
-            if c["id"] == req.id and c.get("done_by"):
-                kid = c["done_by"]
-                c["done_by"] = None
-                d["log"][kid] = [e for e in d["log"].get(kid, []) if e.get("chore_id") != req.id]
+        before = len(d.get("claims", []))
+        d["claims"] = [c for c in d.get("claims", [])
+                       if not (c["id"] == req.id and c["state"] in CLAIM_OPEN)]
         _chores_write(d)
-    return {"status": "ok"}
+    return {"status": "ok", "removed": before - len(d["claims"])}
 
 
 @app.post("/chores/reject")
 async def chores_reject(req: ChoreReject):
-    """Parent sends a claimed chore back: points come off that kid's total, the
-    chore returns to the board, and the comment rides along so the kid sees why."""
+    """Parent sends a claim back. Nothing to claw back - points only ever land on
+    approval - so the claim simply returns to the kid's queue with the note."""
     async with _chores_lock:
         d = _chores_read()
-        c = next((x for x in d["chores"] if x["id"] == req.id), None)
-        if not c:
-            raise HTTPException(status_code=404, detail="chore not found")
-        kid = c.get("done_by")
-        if not kid:
-            raise HTTPException(status_code=409, detail="that chore isn't claimed")
-        # drop it from the kid's log -> the points go with it
-        d["log"][kid] = [e for e in d["log"].get(kid, []) if e.get("chore_id") != req.id]
-        c["done_by"] = None
-        c["posted"] = True
-        c["queued_for"] = kid                   # back into the offender's queue
-        c["queued_by"] = "parent"               # a forced redo stays until it's done
-        c.pop("queued_at", None)
-        c["rejected"] = {
-            "kid": kid,
+        cl = next((c for c in d.get("claims", []) if c["id"] == req.id), None)
+        if not cl:
+            raise HTTPException(status_code=404, detail="claim not found")
+        if cl["state"] != "done":
+            raise HTTPException(status_code=409, detail="that claim isn't waiting")
+        cl["state"] = "queued"
+        cl.pop("done_at", None)
+        cl["rejected"] = {
+            "kid": cl["kid"],
             "comment": (req.comment or "").strip(),
-            "at": datetime.datetime.now().isoformat(timespec="minutes"),
+            "at": _now_local().isoformat(timespec="minutes"),
         }
         d.setdefault("rejections", []).append({
-            "chore": c["name"], "kid": kid, "points": int(c.get("points", 0)),
+            "chore": cl["name"], "kid": cl["kid"], "points": int(cl.get("points", 0)),
             "comment": (req.comment or "").strip(),
-            "at": datetime.datetime.now().isoformat(timespec="minutes"),
+            "at": _now_local().isoformat(timespec="minutes"),
         })
         d["rejections"] = d["rejections"][-100:]
         _chores_write(d)
-    return {"status": "ok", "kid": kid, "points_removed": int(c.get("points", 0))}
+    body = "Your chore [%s] was sent back: %s" % (cl["name"],
+                                                  (req.comment or "").strip() or "please redo it")
+    sent = await _notify(cl["kid"], body, title="Chore sent back",
+                         tag="chore_rejected")
+    return {"status": "ok", "sms": sent}
+
+
+@app.post("/chores/approve")
+async def chores_approve(req: ChoreId):
+    """Parent signs off. This is the moment the points actually move, which is
+    why the board shows banked and pending as two separate numbers."""
+    async with _chores_lock:
+        d = _chores_read()
+        cl = next((c for c in d.get("claims", []) if c["id"] == req.id), None)
+        if not cl:
+            raise HTTPException(status_code=404, detail="claim not found")
+        if cl["state"] == "approved":
+            return {"status": "ok", "already": True}
+        if cl["state"] != "done":
+            raise HTTPException(status_code=409, detail="that claim isn't finished yet")
+        cl["state"] = "approved"
+        cl["approved_at"] = _now_local().isoformat(timespec="seconds")
+        cl.pop("rejected", None)
+        kid = cl["kid"]
+        d["log"].setdefault(kid, []).append({
+            "chore_id": cl["chore_id"], "claim_id": cl["id"], "name": cl["name"],
+            "points": int(cl.get("points", 0)),
+            "on": cl.get("on"), "at": cl["approved_at"],
+        })
+        _chores_write(d)
+    return {"status": "ok", "points": int(cl.get("points", 0)), "kid": cl["kid"]}
+
+
+@app.post("/chores/repost")
+async def chores_repost(req: ChoreId):
+    """Kept so older dashboards don't 404. Chores never leave the board now, so
+    there is nothing to put back."""
+    d = _chores_read()
+    c = next((x for x in d["chores"] if x["id"] == req.id), None)
+    if not c:
+        raise HTTPException(status_code=404, detail="chore not found")
+    return {"status": "ok", "name": c.get("name"), "noop": True}
+
+
+class ChoreReassign(BaseModel):
+    id: int
+    to: str = "na"          # 'ian' | 'evan' | 'parent' | 'na' (back on the board)
+
+
+@app.post("/chores/reassign")
+async def chores_reassign(req: ChoreReassign):
+    """Hand a sent-back claim to the other kid, or drop it. The chore itself was
+    never taken off the board, so 'na' just deletes the claim."""
+    to = (req.to or "na").lower()
+    if to not in ("ian", "evan", "parent", "na"):
+        raise HTTPException(status_code=400, detail="to must be ian, evan, parent or na")
+    async with _chores_lock:
+        d = _chores_read()
+        cl = next((c for c in d.get("claims", []) if c["id"] == req.id), None)
+        if not cl:
+            raise HTTPException(status_code=404, detail="claim not found")
+        if cl["state"] not in CLAIM_OPEN:
+            raise HTTPException(status_code=409, detail="that claim is already closed")
+        name = cl["name"]
+        if to == "na":
+            d["claims"] = [c for c in d["claims"] if c["id"] != req.id]
+        else:
+            cl["kid"] = to
+            cl["state"] = "queued"
+            cl.pop("done_at", None)
+            cl.pop("rejected", None)
+        _chores_write(d)
+    return {"status": "ok", "name": name, "to": to}
 
 
 @app.post("/chores/clear_rejection")
 async def chores_clear_rejection(req: ChoreId):
+    """Dismiss a parent's note without redoing the job - the claim stays queued,
+    it just stops rendering as a FIX card."""
     async with _chores_lock:
         d = _chores_read()
-        for c in d["chores"]:
+        for c in d.get("claims", []):
             if c["id"] == req.id:
                 c.pop("rejected", None)
         _chores_write(d)
@@ -1445,15 +1855,16 @@ def _reset_all(d, on=None):
     (which banks the closing week into history), this erases history entirely."""
     on = on or _today()
     # completed one-off ad-hoc chores just disappear, same as a weekly roll
+    finished_once = {c["chore_id"] for c in d.get("claims", [])
+                     if c.get("state") == "approved"}
     d["chores"] = [c for c in d["chores"]
-                   if not (c.get("frequency") == "once" and c.get("done_by"))]
+                   if not (c.get("frequency") == "once" and c["id"] in finished_once)]
     for c in d["chores"]:
-        c["done_by"] = None
         c.pop("rejected", None)
         c["queued_for"] = "na"
-        c["last_done"] = None
-        c["posted"] = True          # everything on the board and claimable
-    d["log"] = {"ian": [], "evan": []}
+    d["claims"] = []
+    d["next_claim"] = 1
+    d["log"] = {"ian": [], "evan": [], "parent": []}
     d["history"] = []
     d["rejections"] = []
     d["mines"] = {}
@@ -2399,6 +2810,51 @@ async def voice_mirror_status():
             "known_events": len(state.get("mirrored", {}))}
 
 
+class HaCall(BaseModel):
+    domain: str
+    service: str
+    entity_id: str | None = None
+    data: dict | None = None
+
+
+@app.post("/ha/call")
+async def ha_call(req: HaCall):
+    """Call a Home Assistant service. The read-only /ha/state endpoint could
+    observe but never actuate, which made testing automations impossible from
+    here. Scoped to the add-on's own supervisor token, same as everything else."""
+    token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not token:
+        raise HTTPException(status_code=500, detail="no SUPERVISOR_TOKEN")
+    body = dict(req.data or {})
+    if req.entity_id:
+        body["entity_id"] = req.entity_id
+    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+    last = None
+    for base in (SUPERVISOR, SUPERVISOR_IP):
+        url = "%s/services/%s/%s" % (base, req.domain, req.service)
+        try:
+            async with aiohttp.ClientSession(headers=headers) as sess:
+                async with sess.post(url, json=body,
+                                     timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status < 400:
+                        return {"status": "ok", "called": "%s.%s" % (req.domain, req.service),
+                                "target": req.entity_id}
+                    last = "HTTP %d" % r.status
+        except Exception as e:
+            last = str(e)
+    raise HTTPException(status_code=502, detail="service call failed: %s" % last)
+
+
+@app.get("/ha/state/{entity_id}")
+async def ha_state(entity_id: str):
+    """Read-only look at one Home Assistant entity. Diagnostics only: there is
+    no service-call counterpart here, so this can observe but never actuate."""
+    try:
+        return await _ha_get("/states/" + entity_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.get("/cozi/calendar/{year}/{month}")
 async def cozi_calendar(year: int, month: int):
     """A month of Cozi appointments — verification, and the dedupe key for any
@@ -2417,7 +2873,11 @@ async def cozi_calendar(year: int, month: int):
 # the "already synced" marker and nothing arrives twice.
 
 KEEP_DB = "/data/keep.json"
-KEEP = {"every": 60, "err": "", "last": "", "count": 0}
+KEEP = {"every": 60, "err": "", "last": "", "count": 0,
+        # gkeepapi is blocking; without a ceiling a hung call parks the
+        # loop task forever and sync silently stops until the add-on restarts.
+        "timeout": 45, "cycle_timeout": 150,
+        "attempted": "", "timeouts": 0, "failed": 0, "cycles": 0}
 
 
 def _keep_read():
@@ -2480,7 +2940,15 @@ def _keep_sync_sync():
 async def _keep_once():
     if not cozi_client or not logged_in:
         return {"synced": 0, "reason": "Cozi not connected"}
-    res = await asyncio.to_thread(_keep_sync_sync)
+    KEEP["attempted"] = _now_local().isoformat(timespec="seconds")
+    KEEP["cycles"] += 1
+    try:
+        res = await asyncio.wait_for(asyncio.to_thread(_keep_sync_sync),
+                                     timeout=KEEP["timeout"])
+    except asyncio.TimeoutError:
+        KEEP["timeouts"] += 1
+        KEEP["err"] = "Keep read timed out after %ds" % KEEP["timeout"]
+        return {"synced": 0, "reason": KEEP["err"]}
     if not res.get("ok"):
         KEEP["err"] = res.get("reason", "")
         return {"synced": 0, "reason": KEEP["err"]}
@@ -2488,47 +2956,77 @@ async def _keep_once():
     keep, lists = res["keep"], res["lists"]
     cozi_lists = await cozi_client.get_lists()
     d = _keep_read()
-    made, touched = 0, []
-    for note in lists:
-        title = (note.title or "").strip()
-        # Only shopping lists sync from Keep. Otherwise Keep-native planning
-        # lists (Spring break, Christmas, …) that happen to share a Cozi name
-        # get dumped in and duplicated. The alias table is the shopping filter.
-        if not LIST_ALIASES.get(re.sub(r"\s+list$", "", title.lower()).strip()):
-            continue
-        target = _pick_list(title, cozi_lists)
-        if not target:
-            continue
-        for item in list(note.items):
-            if item.checked:
+    made, touched, failed, ticked = 0, [], 0, False
+    try:
+        for note in lists:
+            title = (note.title or "").strip()
+            # Only shopping lists sync from Keep. Otherwise Keep-native planning
+            # lists (Spring break, Christmas, …) that happen to share a Cozi name
+            # get dumped in and duplicated. The alias table is the shopping filter.
+            if not LIST_ALIASES.get(re.sub(r"\s+list$", "", title.lower()).strip()):
                 continue
-            text = (item.text or "").strip()
-            if not text:
+            target = _pick_list(title, cozi_lists)
+            if not target:
                 continue
-            await cozi_client.add_item(target.get("listId") or target.get("list_id"), text, 0)
-            item.checked = True            # the tick is the synced marker
-            made += 1
-            touched.append("%s -> %s" % (text, target.get("title")))
-            _voice_log({"at": _now_local().isoformat(timespec="seconds"),
-                        "text": text, "source": "keep", "ok": True, "intent": "list",
-                        "speech": "Copied %s from the %s Keep list to %s."
-                                  % (text, title, target.get("title")),
-                        "detail": {"keep_list": title, "cozi_list": target.get("title")}})
-    if made:
-        await asyncio.to_thread(keep.sync)
-    d["state"] = keep.dump()
-    d["last"] = _now_local().isoformat(timespec="seconds")
-    _keep_write(d)
-    KEEP["last"] = d["last"]
+            for item in list(note.items):
+                if item.checked:
+                    continue
+                text = (item.text or "").strip()
+                if not text:
+                    continue
+                try:
+                    await cozi_client.add_item(
+                        target.get("listId") or target.get("list_id"), text, 0)
+                except Exception as exc:
+                    # Leave it unchecked so it retries, but keep going: one bad
+                    # item used to abort the whole pass, which stranded the ticks
+                    # for everything already copied and re-copied them next run.
+                    failed += 1
+                    KEEP["err"] = "%s: %s" % (text, exc)
+                    continue
+                item.checked = True            # the tick is the synced marker
+                ticked = True
+                made += 1
+                touched.append("%s -> %s" % (text, target.get("title")))
+                _voice_log({"at": _now_local().isoformat(timespec="seconds"),
+                            "text": text, "source": "keep", "ok": True, "intent": "list",
+                            "speech": "Copied %s from the %s Keep list to %s."
+                                      % (text, title, target.get("title")),
+                            "detail": {"keep_list": title, "cozi_list": target.get("title")}})
+    finally:
+        # Always push the ticks we managed to set and always save local state,
+        # even if the pass blew up part way. Skipping this is what produced the
+        # duplicate copies (Tobacco went to Kroger on two consecutive days).
+        if ticked:
+            try:
+                await asyncio.wait_for(asyncio.to_thread(keep.sync),
+                                       timeout=KEEP["timeout"])
+            except Exception as exc:
+                KEEP["err"] = "checkmark push failed: %s" % exc
+        try:
+            d["state"] = keep.dump()
+            d["last"] = _now_local().isoformat(timespec="seconds")
+            _keep_write(d)
+            KEEP["last"] = d["last"]
+        except Exception as exc:
+            KEEP["err"] = "state save failed: %s" % exc
     KEEP["count"] += made
-    return {"synced": made, "items": touched}
+    KEEP["failed"] = failed
+    return {"synced": made, "items": touched, "failed": failed}
 
 
 async def _keep_loop():
     while True:
         try:
             if _keep_read().get("master_token"):
-                await _keep_once()
+                # Hard ceiling on the whole cycle. Previously a single hung
+                # gkeepapi call left this task awaiting forever, so Keep only
+                # ever synced when the add-on restarted.
+                await asyncio.wait_for(_keep_once(), timeout=KEEP["cycle_timeout"])
+        except asyncio.TimeoutError:
+            KEEP["timeouts"] += 1
+            KEEP["err"] = "Keep cycle timed out after %ds" % KEEP["cycle_timeout"]
+            print("Keep sync: %s" % KEEP["err"])
         except Exception as e:
             KEEP["err"] = str(e)
             print("Keep sync: %s" % e)
@@ -2571,9 +3069,14 @@ async def keep_login(req: KeepLogin):
 @app.get("/keep/status")
 async def keep_status():
     d = _keep_read()
+    # `last_attempt` is the tell: if it keeps advancing while `last_sync` sits
+    # still, the loop is alive and there is simply nothing new. If it stops
+    # advancing, the loop itself has stalled.
     return {"configured": bool(d.get("master_token")), "email": d.get("email", ""),
             "last_sync": d.get("last", ""), "synced_this_run": KEEP["count"],
-            "error": KEEP["err"]}
+            "error": KEEP["err"], "last_attempt": KEEP["attempted"],
+            "cycles": KEEP["cycles"], "timeouts": KEEP["timeouts"],
+            "failed_last_pass": KEEP["failed"], "poll_seconds": KEEP["every"]}
 
 
 @app.post("/keep/sync")
@@ -2607,6 +3110,73 @@ async def keep_newlist(req: KeepNewList):
         d["state"] = out["state"]
         _keep_write(d)
     return {"status": "ok", "title": req.title, "already_there": out.get("existed")}
+
+
+class KeepShare(BaseModel):
+    email: str
+    titles: list[str] | None = None
+
+
+@app.post("/keep/share")
+async def keep_share(req: KeepShare):
+    """Add a collaborator to the shared Keep lists.
+
+    Google Assistant resolves "add X to my Costco list" against the *speaking*
+    user's own Keep, so a second person in the house gets told the list does not
+    exist. Sharing fixes that without moving anything: a shared note stays owned
+    by the account this add-on authenticates as, so the Cozi sync keeps seeing
+    every item either person adds.
+
+    Pass `titles` to share specific lists, or omit it to share every list that
+    currently maps onto a Cozi list.
+    """
+    email = (req.email or "").strip()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="a real email address is required")
+
+    def _share(cozi_lists):
+        res = _keep_sync_sync()
+        if not res.get("ok"):
+            return res
+        keep = res["keep"]
+        wanted = None
+        if req.titles:
+            wanted = {t.strip().lower() for t in req.titles}
+        done, skipped = [], []
+        for note in res["lists"]:
+            title = (note.title or "").strip()
+            if wanted is not None:
+                if title.lower() not in wanted:
+                    continue
+            elif not _pick_list(title, cozi_lists):
+                # Same matcher the sync uses, so the default set is exactly the
+                # lists that actually flow into Cozi. Exact title equality missed
+                # "Home Depot / Lowe's" -> "Home Depot/Lowe's".
+                skipped.append({"list": title, "why": "no matching Cozi list"})
+                continue
+            existing = [str(c).lower() for c in note.collaborators.all()]
+            if email.lower() in existing:
+                skipped.append({"list": title, "why": "already shared"})
+                continue
+            try:
+                note.collaborators.add(email)
+                done.append(title)
+            except Exception as e:
+                skipped.append({"list": title, "why": str(e)})
+        if done:
+            keep.sync()
+        return {"ok": True, "shared": done, "skipped": skipped, "state": keep.dump()}
+
+    cozi_lists = await cozi_client.get_lists() if (cozi_client and logged_in) else []
+    out = await asyncio.to_thread(_share, cozi_lists)
+    if not out.get("ok"):
+        raise HTTPException(status_code=400, detail=out.get("reason"))
+    if out.get("state"):
+        d = _keep_read()
+        d["state"] = out["state"]
+        _keep_write(d)
+    return {"status": "ok", "collaborator": email,
+            "shared": out["shared"], "skipped": out["skipped"]}
 
 
 @app.get("/keep/lists")

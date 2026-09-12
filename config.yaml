@@ -1,5 +1,5 @@
 name: "Cozi Proxy API"
-version: "1.20.9"
+version: "2.2.0"
 slug: "cozi_proxy2"
 description: "Local API bridge for Cozi To-Do lists"
 arch:
@@ -28,6 +28,18 @@ options:
   phone_evan: ""
   phone_mom: ""
   phone_dad: ""
+  # --- Companion-app push (recommended). Carrier email-to-SMS is being retired
+  # (AT&T June 2025, T-Mobile Dec 2024, Verizon vtext.com completes 2027-03-31
+  # and already drops messages silently), so alerts also go out as Home
+  # Assistant push, which reaches phones away from home with no port
+  # forwarding and no Nabu Casa. Values are the notify service WITHOUT the
+  # "notify." prefix. Blank disables push for that person.
+  push_mom: "mobile_app_mom_phone"
+  push_dad: "mobile_app_dad_phone"
+  push_ian: ""
+  push_evan: ""
+  # Parent alerts text mom (as before) but push to BOTH parents.
+  push_parents_both: true
   timezone: "America/New_York"
   # --- voice intents (optional). Maps what people are *called* out loud to the
   # names on your Cozi household, for "create an appointment for mom...".
@@ -54,6 +66,11 @@ schema:
   phone_evan: str
   phone_mom: str
   phone_dad: str
+  push_mom: str?
+  push_dad: str?
+  push_ian: str?
+  push_evan: str?
+  push_parents_both: bool?
   timezone: str
   voice_aliases: str
   mirror_calendars: str
