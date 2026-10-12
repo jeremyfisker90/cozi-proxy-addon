@@ -815,19 +815,41 @@ def _pending_points(d):
     return out
 
 
+_CLAIM_TIMES = ("on", "queued_at", "done_at", "approved_at")
+
+
+def _claim_record(c):
+    """One claim as the closed week remembers it. The timestamps are what the
+    Prior Week Report lays out Monday to Sunday; before 2.3.0 only name, kid and
+    points were kept, so a closed week could say WHAT was done but never WHEN."""
+    rec = {"name": c["name"], "by": c["kid"], "points": c.get("points", 0),
+           "chore_id": c.get("chore_id"), "claim_id": c.get("id")}
+    for k in _CLAIM_TIMES:
+        if c.get(k):
+            rec[k] = c[k]
+    if c.get("state") != "approved":
+        rec["state"] = c.get("state")
+    return rec
+
+
 def _roll_week(d, on=None):
     """Close out the week: stamp completions, clear the board, re-post what's due."""
     on = on or _today()
     # Approved claims are the week's record now; the chores themselves never
     # changed state, so there is nothing on them to stamp.
     done = _claims_for(d, state="approved")
-    if done:
+    # The roll below throws away every claim that is not approved. A job a kid
+    # finished on Sunday that no parent signed off simply vanished at midnight,
+    # points and all, with nothing left to show it ever happened. Keep a record
+    # of those so the weekly audit can see what was missed.
+    unapproved = [c for c in d.get("claims", []) if c.get("state") in CLAIM_OPEN]
+    if done or unapproved:
         d.setdefault("history", []).append({
             "week_start": d.get("week_start"),
             "closed": on.isoformat(),
             "totals": {k: sum(int(e.get("points", 0)) for e in v) for k, v in d["log"].items()},
-            "completed": [{"name": c["name"], "by": c["kid"],
-                           "points": c.get("points", 0)} for c in done],
+            "completed": [_claim_record(c) for c in done],
+            "unapproved": [_claim_record(c) for c in unapproved],
         })
         d["history"] = d["history"][-52:]          # keep a year
     # a one-off that somebody actually finished has served its purpose
@@ -1609,7 +1631,9 @@ async def chores_assign(req: ChoreClaim):
 @app.post("/chores/claim")
 async def chores_claim(req: ChoreClaim):
     """A kid takes a job. This creates a claim; the chore itself is untouched and
-    stays on the board, so the other kid can take the same job the same day."""
+    stays on the board, so anyone can take the same job again the same day -
+    including the same kid, and including while an earlier claim is still
+    waiting on a parent."""
     kid = req.kid.lower()
     if kid not in ("ian", "evan", "parent"):
         raise HTTPException(status_code=400, detail="kid must be ian, evan or parent")
@@ -1618,12 +1642,15 @@ async def chores_claim(req: ChoreClaim):
         target = next((c for c in d["chores"] if c["id"] == req.id), None)
         if not target:
             raise HTTPException(status_code=404, detail="chore not found")
-        # One open claim each. Repeats are unlimited, but finish the one you have
-        # before taking the same job again, or the queue fills with duplicates.
-        if any(c["state"] in CLAIM_OPEN
-               for c in _claims_for(d, kid=kid, chore_id=req.id)):
-            raise HTTPException(status_code=409,
-                                detail="You already have that one in your queue")
+        # No gate: any job, any number of times a day, by anyone.
+        # There used to be a one-open-claim-per-kid-per-chore check returning
+        # 409. It did not block repeats so much as UNAPPROVED ones, because
+        # CLAIM_OPEN counts "done" as still open - so a chore finished days ago
+        # and never signed off stayed unclaimable, which reads as a broken board
+        # rather than a pending approval. The board already told kids "take it as
+        # many times as you earn it"; this makes that true.
+        # Tradeoff: a double-tap makes two claims. They show separately, so a
+        # parent can reject the extra.
         cid = d.get("next_claim", 1)
         d["next_claim"] = cid + 1
         d.setdefault("claims", []).append({
@@ -1838,6 +1865,54 @@ async def chores_sync():
 async def chores_history():
     d = _chores_read()
     return {"history": d.get("history", []), "rejections": d.get("rejections", [])}
+
+
+class HistoryAnnotate(BaseModel):
+    week_start: str
+    completed: list[dict]
+    unapproved: list[dict] = []
+    source: str = ""
+
+
+_ANNOTATE_KEYS = ("name", "by", "points", "chore_id", "claim_id", "state", "note") + _CLAIM_TIMES
+
+
+@app.post("/chores/history/annotate")
+async def chores_history_annotate(req: HistoryAnnotate):
+    """Put day and time back onto a week that closed before 2.3.0 kept them,
+    recovered from a backup taken while the week was still live.
+
+    It can only ADD times. The jobs sent must be exactly the jobs already
+    banked for that week - same names, same people, same points - so nothing a
+    kid was credited with can be changed, added or taken away through here. A
+    week that already has times is refused, so it cannot be overwritten either."""
+    def key(e):
+        return (str(e.get("name", "")), str(e.get("by", "")), int(e.get("points", 0) or 0))
+
+    def clean(e):
+        return {k: e[k] for k in _ANNOTATE_KEYS if e.get(k) not in (None, "")}
+
+    async with _chores_lock:
+        d = _chores_read()
+        wk = next((h for h in d.get("history", [])
+                   if h.get("week_start") == req.week_start), None)
+        if not wk:
+            raise HTTPException(status_code=404, detail="no closed week starting %s" % req.week_start)
+        if any(e.get(t) for e in wk.get("completed", []) for t in _CLAIM_TIMES):
+            raise HTTPException(status_code=409, detail="that week already has times")
+        have = sorted(key(e) for e in wk.get("completed", []))
+        sent = sorted(key(e) for e in req.completed)
+        if have != sent:
+            raise HTTPException(status_code=409, detail={
+                "error": "jobs do not match what was banked for that week",
+                "banked": len(have), "sent": len(sent)})
+        wk["completed"] = [clean(e) for e in req.completed]
+        wk["unapproved"] = [clean(e) for e in req.unapproved]
+        wk["backfilled"] = {"source": req.source,
+                            "at": _now_local().isoformat(timespec="seconds")}
+        _chores_write(d)
+    return {"status": "ok", "week_start": req.week_start,
+            "completed": len(req.completed), "unapproved": len(req.unapproved)}
 
 
 @app.post("/chores/newweek")
